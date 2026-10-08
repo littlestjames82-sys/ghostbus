@@ -39,8 +39,10 @@
     "demo-team": "node examples/three-agent-team.mjs",
     "relay": "node src/http-server.mjs",
     "start": "node src/mcp-server.mjs",
-    "test": "node test.mjs"
+    "test": "node test.mjs",
+    "test:serverless": "node deploy/netlify/test-lib.mjs",
+    "hosted": "node src/hosted-server.mjs"
   },
   "type": "module",
-  "version": "0.3.0"
+  "version": "0.4.0"
 }

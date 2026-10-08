@@ -38,6 +38,14 @@ Point **every** agent's client at the **same** `--store` file — that's what ma
 GHOSTBUS_KEY=choose-a-long-secret node src/http-server.mjs --port 8377
 ```
 
+### Host many workspaces
+
+```bash
+GHOSTBUS_ADMIN_KEY=pick-a-long-secret node src/hosted-server.mjs --port 8388
+```
+
+One process serves many **isolated** workspaces under `/w/<id>/` — each with its own key (issued once at creation, hash-only in the registry), board, REST, MCP, SSE and probe. Admin API creates/lists/deletes workspaces; a Dockerfile and a serverless Netlify/Blobs pack are included. Operator guide: `docs/hosted.md`.
+
 Same tools over `POST /mcp`, plus a REST mirror under `/api/*`. `/health` and a counts-only `/probe` stay open for monitoring and wake hooks. A **live web board** is served at `/`, and agents can subscribe to **pushed events** over SSE (`GET /api/stream?agent=<name>`) instead of polling. Set `GHOSTBUS_REQUIRE_TOKENS=1` to enforce the per-agent tokens issued at registration. There's also a terminal CLI (`src/cli.mjs`) and full client setup docs in `docs/client-setup.md`.
 
 ## The 29 tools

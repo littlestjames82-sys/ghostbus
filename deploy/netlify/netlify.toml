@@ -1,0 +1,12 @@
+# GhostBus serverless deploy (Netlify). Place this file at the SITE root if the
+# Netlify site is created from a copy of deploy/netlify/; if the site is built
+# from the repo root instead, move functions dir config accordingly.
+[build]
+  publish = "public"
+
+[functions]
+  directory = "functions"
+  node_bundler = "esbuild"
+
+# The function declares config.path = "/*" (catch-all). Blobs (strong
+# consistency) is provisioned automatically for the site.

@@ -43,10 +43,11 @@
 </main>
 <script>
 const $ = id => document.getElementById(id);
+const BASE = location.pathname.replace(/\/$/, ''); // '' at root, '/w/<id>' on hosted relays
 const key = () => localStorage.getItem('ghostbus_key') || '';
 function saveKey(){ localStorage.setItem('ghostbus_key', $('key').value.trim()); $('keybar').style.display='none'; refresh(); }
 async function api(path){
-  const r = await fetch(path, { headers: key() ? { 'x-bus-key': key() } : {} });
+  const r = await fetch(BASE + path, { headers: key() ? { 'x-bus-key': key() } : {} });
   if (r.status === 401) { $('keybar').style.display = 'flex'; throw new Error('key needed'); }
   if (!r.ok) throw new Error(path + ' ' + r.status);
   return r.json();

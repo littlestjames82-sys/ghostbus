@@ -399,6 +399,61 @@ await check('http: long-poll /api/wait delivers, capsules + sync over REST, secu
   } finally { proc.kill(); }
 });
 
+/* ---------------- hosted multi-workspace ---------------- */
+console.log('hosted:');
+await check('hosted: admin-gated creation, per-workspace keys, full isolation, MCP per workspace', async () => {
+  const dataDir = path.join(tmp, 'hosted-data');
+  const env = { ...process.env, GHOSTBUS_ADMIN_KEY: 'admin-secret-123' };
+  const proc = spawn('node', ['src/hosted-server.mjs', '--port', '18382', '--data-dir', dataDir], { cwd: new URL('.', import.meta.url).pathname, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const A = { 'content-type': 'application/json', 'x-bus-key': 'admin-secret-123' };
+  const J = (r) => r.json();
+  try {
+    for (let i = 0; i < 50; i++) { try { const r = await fetch('http://127.0.0.1:18382/health'); if (r.ok) break; } catch {} await new Promise(r => setTimeout(r, 100)); }
+    // creation requires admin
+    assert.equal((await fetch('http://127.0.0.1:18382/api/workspaces', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: 'alpha' }) })).status, 401);
+    const c1 = await J(await fetch('http://127.0.0.1:18382/api/workspaces', { method: 'POST', headers: A, body: JSON.stringify({ id: 'alpha', name: 'Alpha Team' }) }));
+    assert.ok(c1.key && c1.key.length >= 32);
+    const c2 = await J(await fetch('http://127.0.0.1:18382/api/workspaces', { method: 'POST', headers: A, body: JSON.stringify({ id: 'beta', name: 'Beta Team' }) }));
+    assert.notEqual(c1.key, c2.key);
+    // duplicate id refused
+    assert.equal((await fetch('http://127.0.0.1:18382/api/workspaces', { method: 'POST', headers: A, body: JSON.stringify({ id: 'alpha' }) })).status, 409);
+    const KA = { 'content-type': 'application/json', 'x-bus-key': c1.key };
+    const KB = { 'content-type': 'application/json', 'x-bus-key': c2.key };
+    // wrong key / other workspace's key rejected
+    assert.equal((await fetch('http://127.0.0.1:18382/w/alpha/api/status', { headers: KB })).status, 401);
+    assert.equal((await fetch('http://127.0.0.1:18382/w/alpha/api/status')).status, 401);
+    // admin key works as master inside a workspace
+    assert.equal((await fetch('http://127.0.0.1:18382/w/alpha/api/status', { headers: A })).status, 200);
+    // work in alpha only
+    await fetch('http://127.0.0.1:18382/w/alpha/api/agents', { method: 'POST', headers: KA, body: JSON.stringify({ agent: 'alpha-agent', role: 'a' }) });
+    await fetch('http://127.0.0.1:18382/w/alpha/api/tasks', { method: 'POST', headers: KA, body: JSON.stringify({ agent: 'alpha-agent', title: 'Alpha-only task' }) });
+    const betaAgents = await J(await fetch('http://127.0.0.1:18382/w/beta/api/agents', { headers: KB }));
+    assert.equal(betaAgents.agents.length, 0); // isolation: beta sees none of alpha's agents
+    const betaTasks = await J(await fetch('http://127.0.0.1:18382/w/beta/api/tasks', { headers: KB }));
+    assert.equal(betaTasks.tasks.length, 0);
+    const alphaTasks = await J(await fetch('http://127.0.0.1:18382/w/alpha/api/tasks', { headers: KA }));
+    assert.equal(alphaTasks.tasks.length, 1);
+    // probe open per workspace + counts only alpha's work
+    const probe = await J(await fetch('http://127.0.0.1:18382/w/alpha/probe'));
+    assert.equal(probe.queued, 1); assert.equal(probe.workspace, 'alpha');
+    // board page under prefix
+    const board = await fetch('http://127.0.0.1:18382/w/alpha/');
+    assert.equal(board.status, 200); assert.match(await board.text(), /GhostBus Board/);
+    // MCP inside a workspace
+    const mcp = await J(await fetch('http://127.0.0.1:18382/w/beta/mcp', { method: 'POST', headers: KB, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'bus_register', arguments: { agent: 'beta-agent' } } }) }));
+    assert.ok(!mcp.result.isError, JSON.stringify(mcp));
+    const betaAgents2 = await J(await fetch('http://127.0.0.1:18382/w/beta/api/agents', { headers: KB }));
+    assert.equal(betaAgents2.agents.length, 1);
+    // admin listing + delete
+    const list = await J(await fetch('http://127.0.0.1:18382/api/workspaces', { headers: A }));
+    assert.equal(list.workspaces.length, 2);
+    assert.equal((await fetch('http://127.0.0.1:18382/api/workspaces/beta', { method: 'DELETE', headers: A })).status, 200);
+    assert.equal((await fetch('http://127.0.0.1:18382/w/beta/api/status', { headers: KB })).status, 404);
+    // unknown workspace 404
+    assert.equal((await fetch('http://127.0.0.1:18382/w/nope/probe')).status, 404);
+  } finally { proc.kill(); }
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 fs.rmSync(tmp, { recursive: true, force: true });
 process.exit(fail ? 1 : 0);

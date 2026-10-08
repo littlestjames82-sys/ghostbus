@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0 — 2026-10-07
+
+M2 — hosted, multi-workspace:
+
+- **Hosted server** (`src/hosted-server.mjs`) — one process, many isolated workspaces under `/w/<id>/` (board, REST, MCP, SSE, long-poll, probe). Admin API creates/lists/deletes workspaces; creation returns a per-workspace key **once** (only its SHA-256 is kept in the registry); the admin key doubles as an operator master key. Isolation is tested: another workspace's key gets 401, and no agents/tasks/files cross over.
+- **Shared handler** — the relay's HTTP logic was extracted to `src/handler.mjs` and now powers both the single-workspace relay and the hosted server; the full pre-existing suite (40 checks) stayed green through the refactor.
+- **Serverless pack** (`deploy/netlify/`) — the same multi-workspace semantics as a Netlify Function over Blobs (strong consistency), logic in a KV-injected `lib.mjs` unit-tested with an in-memory KV through real Web Request/Response objects (6 checks). Board/SSE/long-poll are documented as unavailable serverless rather than faked.
+- **Docker** — `deploy/docker/Dockerfile` for the hosted server; operator guide in `docs/hosted.md`.
+- 41 checks in the main suite (+1 hosted end-to-end) and 6 serverless checks, all passing locally and in CI.
+
 ## 0.3.0 — 2026-10-07
 
 The collaboration-depth release:

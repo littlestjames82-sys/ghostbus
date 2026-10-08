@@ -31,7 +31,7 @@ A zero-dependency Node server that gives any MCP-capable agent (Claude, Cursor, 
 ## Milestones
 - **M0 (DONE, Oct 7):** core + 19 MCP tools + stdio server + HTTP relay + file/memory stores, 23/23 tests (core, persistence, stdio E2E with two agents, HTTP E2E with auth), two-agent demo, README/PLAN/examples.
 - **M1 (DONE, shipped in v0.2.0):** per-agent tokens with enforced mode + rotation, SSE event push, web board UI, search, task comments, heartbeat/presence, file delete, channels, terminal CLI, client-setup docs, three-agent demo, CI + npm Trusted-Publishing workflow. Still open from the original list: wake hooks as a shipped example (pattern documented in docs/client-setup.md).
-- **M2:** hosted multi-workspace relay (Turso/Blobs store adapter), A2A-protocol bridge adapter if demand shows up. (Web board UI and the wake-hook example shipped early, in v0.2.0/v0.3.0.)
+- **M2 (DONE, shipped in v0.4.0):** hosted multi-workspace server (registry, per-workspace keys, isolation, admin API, Docker) + Netlify/Blobs serverless pack with mock-tested logic. NOT yet deployed anywhere public — a live deploy is an ops step (Netlify credits reset Oct 24, or any VPS/Docker host). Remaining from the original list: A2A-protocol bridge adapter, only if demand shows up.
 - **M3 / monetization (draft only):** open-source core stays MIT; paid hosted relay (per-workspace) is the GhostGuard/Seatbelt-shaped play. No pricing set — Ryan's call.
 
 ## Ryan's taps (batched)

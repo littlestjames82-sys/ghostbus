@@ -17,3 +17,4 @@ jobs:
       - run: node test.mjs
       - run: node examples/two-agent-demo.mjs > /dev/null
       - run: node examples/three-agent-team.mjs > /dev/null
+      - run: node deploy/netlify/test-lib.mjs

@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GhostBus — Shared Workspace Board</title>
+<style>
+  :root { --violet:#6716f3; --bg:#0e0c14; --panel:#17131f; --line:#2a2138; --text:#ece8f5; --muted:#9b8fb5; }
+  * { box-sizing:border-box; } body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--text); }
+  header { display:flex; align-items:center; gap:12px; padding:14px 20px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:18px; margin:0; } header .dot { width:10px;height:10px;border-radius:50%;background:#3ddc84; }
+  header span { color:var(--muted); font-size:13px; }
+  main { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:16px; padding:16px 20px; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px; }
+  section h2 { font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin:0 0 10px; }
+  .agent, .task, .file, .ev { padding:7px 0; border-bottom:1px dashed var(--line); font-size:14px; }
+  .agent:last-child,.task:last-child,.file:last-child,.ev:last-child{border-bottom:none}
+  .pill { display:inline-block; padding:1px 8px; border-radius:99px; font-size:11px; background:#241a3d; color:#c9b8ff; margin-left:6px; }
+  .pill.green{ background:#123524; color:#7fe6ae; } .pill.amber{ background:#3a2c10; color:#ffd97a; }
+  .muted{ color:var(--muted); font-size:12px; } a{ color:#c9b8ff; }
+  #keybar { padding:10px 20px; border-bottom:1px solid var(--line); display:none; gap:8px; }
+  input { background:#0e0c14; border:1px solid var(--line); color:var(--text); border-radius:8px; padding:6px 10px; }
+  button { background:var(--violet); color:#fff; border:none; border-radius:8px; padding:6px 14px; cursor:pointer; }
+</style>
+</head>
+<body>
+<header>
+  <div class="dot" id="dot"></div>
+  <h1>👻 GhostBus Board</h1>
+  <span id="ws">connecting…</span>
+  <span style="margin-left:auto" id="clock"></span>
+</header>
+<div id="keybar">
+  <span class="muted">This relay requires the workspace key:</span>
+  <input id="key" type="password" placeholder="GHOSTBUS_KEY" size="28">
+  <button onclick="saveKey()">Connect</button>
+</div>
+<main>
+  <section><h2>Agents</h2><div id="agents">—</div></section>
+  <section><h2>Open tasks</h2><div id="tasks">—</div></section>
+  <section><h2>Shared files</h2><div id="files">—</div></section>
+  <section><h2>Recent activity</h2><div id="events">—</div></section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const key = () => localStorage.getItem('ghostbus_key') || '';
+function saveKey(){ localStorage.setItem('ghostbus_key', $('key').value.trim()); $('keybar').style.display='none'; refresh(); }
+async function api(path){
+  const r = await fetch(path, { headers: key() ? { 'x-bus-key': key() } : {} });
+  if (r.status === 401) { $('keybar').style.display = 'flex'; throw new Error('key needed'); }
+  if (!r.ok) throw new Error(path + ' ' + r.status);
+  return r.json();
+}
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+async function refresh(){
+  try {
+    const [status, agents, tasks, files, events] = await Promise.all([
+      api('/api/status'), api('/api/agents'), api('/api/tasks'), api('/api/files/list'), api('/api/events?limit=12')
+    ]);
+    $('ws').textContent = `${status.workspace.name} · v${status.version} · ${status.messages} messages`;
+    $('dot').style.background = '#3ddc84';
+    $('agents').innerHTML = agents.agents.length ? agents.agents.map(a =>
+      `<div class="agent"><strong>${esc(a.name)}</strong><span class="pill ${a.online?'green':''}">${a.online?'online':'away'}</span><br><span class="muted">${esc(a.role||'agent')}${a.capabilities?.length ? ' · ' + esc(a.capabilities.join(', ')) : ''} · last seen ${esc(a.lastSeenAt)}</span></div>`).join('') : '<span class="muted">none registered</span>';
+    const open = tasks.tasks.filter(t => !['done','cancelled'].includes(t.status));
+    $('tasks').innerHTML = open.length ? open.map(t =>
+      `<div class="task">#${t.id} <strong>${esc(t.title)}</strong><span class="pill ${t.status==='needs-approval'?'amber':''}">${esc(t.status)}</span><br><span class="muted">from ${esc(t.from)}${t.claimedBy ? ' · claimed by ' + esc(t.claimedBy) : ''}${t.assignee ? ' · for ' + esc(t.assignee) : ''}</span></div>`).join('') : '<span class="muted">queue is empty</span>';
+    $('files').innerHTML = files.files.length ? files.files.map(f =>
+      `<div class="file">📄 ${esc(f.path)}<br><span class="muted">${f.bytes} bytes · ${esc(f.updatedBy)} · ${esc(f.updatedAt)}</span></div>`).join('') : '<span class="muted">no shared files</span>';
+    $('events').innerHTML = events.events.slice().reverse().map(e =>
+      `<div class="ev"><span class="muted">${esc(e.at)}</span> <strong>${esc(e.actor)}</strong> ${esc(e.summary)}</div>`).join('');
+    $('clock').textContent = 'updated ' + new Date().toLocaleTimeString();
+  } catch (e) { $('dot').style.background = '#e05252'; $('ws').textContent = 'disconnected: ' + e.message; }
+}
+refresh(); setInterval(refresh, 5000);
+</script>
+</body>
+</html>

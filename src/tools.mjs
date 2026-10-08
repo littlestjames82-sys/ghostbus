@@ -14,7 +14,7 @@ export const TOOLS = [
   { name: 'bus_send', description: 'Send a message to one agent (to = its name) or broadcast (to = "*"). Set threadId to reply in a thread.', inputSchema: { type: 'object', required: ['agent', 'body'], properties: { agent: { type: 'string' }, to: { type: 'string', default: '*' }, body: { type: 'string' }, channel: { type: 'string', default: 'general' }, threadId: { type: 'number' } } } },
   { name: 'bus_inbox', description: 'Read messages visible to this agent (direct, broadcast, and its own). Marks them read unless markRead=false.', inputSchema: { type: 'object', required: ['agent'], properties: { agent: { type: 'string' }, unreadOnly: { type: 'boolean', default: false }, limit: { type: 'number', default: 50 }, markRead: { type: 'boolean', default: true } } } },
   { name: 'bus_thread', description: 'Read a message thread (root message + its replies).', inputSchema: { type: 'object', required: ['id'], properties: { id: { type: 'number' } } } },
-  { name: 'bus_create_task', description: 'Create a handoff task. Optionally assign it, mark urgent, or gate it behind human/agent approval (needsApproval).', inputSchema: { type: 'object', required: ['agent', 'title'], properties: { agent: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' }, assignee: { type: 'string' }, priority: { type: 'string', enum: ['normal', 'urgent'] }, needsApproval: { type: 'boolean', default: false } } } },
+  { name: 'bus_create_task', description: 'Create a handoff task. Optionally assign it, mark urgent, or gate it behind human/agent approval (needsApproval).', inputSchema: { type: 'object', required: ['agent', 'title'], properties: { agent: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' }, assignee: { type: 'string' }, priority: { type: 'string', enum: ['normal', 'urgent'] }, needsApproval: { type: 'boolean', default: false }, blockedBy: { type: 'array', items: { type: 'number' } } } } },
   { name: 'bus_list_tasks', description: 'List tasks, optionally filtered by status or assignee/claimer.', inputSchema: { type: 'object', properties: { status: { type: 'string' }, assignee: { type: 'string' } } } },
   { name: 'bus_approve_task', description: 'Approve a task that is waiting in needs-approval, releasing it to the queue.', inputSchema: { type: 'object', required: ['agent', 'id'], properties: { agent: { type: 'string' }, id: { type: 'number' } } } },
   { name: 'bus_claim_task', description: 'Claim a queued task exclusively (15-minute lease). Fails if another agent holds it.', inputSchema: { type: 'object', required: ['agent', 'id'], properties: { agent: { type: 'string' }, id: { type: 'number' } } } },
@@ -28,6 +28,10 @@ export const TOOLS = [
   { name: 'workspace_board', description: 'Render the shared board: agents, open tasks, files, recent activity.', inputSchema: { type: 'object', properties: {} } },
   { name: 'bus_comment_task', description: 'Comment on a task (discussion lives on the task, next to its history).', inputSchema: { type: 'object', required: ['agent', 'id', 'body'], properties: { agent: { type: 'string' }, id: { type: 'number' }, body: { type: 'string' }, token: { type: 'string' } } } },
   { name: 'workspace_delete_file', description: 'Delete a shared workspace file.', inputSchema: { type: 'object', required: ['agent', 'path'], properties: { agent: { type: 'string' }, path: { type: 'string' }, token: { type: 'string' } } } },
+  { name: 'bus_sync', description: 'Catch-up sync: all provenance events after a sequence number (an agent that was offline replays exactly what it missed). Returns headSeq to store as the next cursor.', inputSchema: { type: 'object', properties: { sinceSeq: { type: 'number', default: 0 }, limit: { type: 'number', default: 500 } } } },
+  { name: 'workspace_get_capsule', description: 'Read a project capsule (structured shared memory: State / Decisions (locked) / Next / Session log). Creates it from the template when create=true.', inputSchema: { type: 'object', required: ['slug'], properties: { slug: { type: 'string' }, create: { type: 'boolean', default: false }, title: { type: 'string' }, agent: { type: 'string' }, token: { type: 'string' } } } },
+  { name: 'workspace_update_capsule', description: 'Update one capsule section (State, Decisions (locked), Next) or append a Session log entry. Other sections are preserved.', inputSchema: { type: 'object', required: ['agent', 'slug', 'section', 'text'], properties: { agent: { type: 'string' }, slug: { type: 'string' }, section: { type: 'string', enum: ['State', 'Decisions (locked)', 'Next', 'Session log'] }, text: { type: 'string' }, token: { type: 'string' } } } },
+  { name: 'workspace_file_history', description: 'Version history of a shared file (current version + up to 10 previous).', inputSchema: { type: 'object', required: ['path'], properties: { path: { type: 'string' } } } },
   { name: 'bus_events', description: 'Read the provenance event log (who did what, when).', inputSchema: { type: 'object', properties: { limit: { type: 'number', default: 50 } } } },
 ];
 
@@ -39,7 +43,7 @@ export async function callTool(bus, name, args = {}) {
     case 'bus_send': return bus.sendMessage({ from: args.agent, to: args.to ?? '*', body: args.body, channel: args.channel ?? 'general', threadId: args.threadId ?? null, token: args.token ?? null });
     case 'bus_inbox': return { messages: await bus.inbox(args.agent, { unreadOnly: !!args.unreadOnly, limit: args.limit ?? 50, markRead: args.markRead !== false, token: args.token ?? null }) };
     case 'bus_thread': return { messages: await bus.thread(args.id) };
-    case 'bus_create_task': return bus.createTask({ from: args.agent, title: args.title, body: args.body ?? '', assignee: args.assignee ?? null, priority: args.priority ?? 'normal', needsApproval: !!args.needsApproval, token: args.token ?? null });
+    case 'bus_create_task': return bus.createTask({ from: args.agent, title: args.title, body: args.body ?? '', assignee: args.assignee ?? null, priority: args.priority ?? 'normal', needsApproval: !!args.needsApproval, blockedBy: args.blockedBy ?? [], token: args.token ?? null });
     case 'bus_list_tasks': return { tasks: await bus.listTasks({ status: args.status ?? null, assignee: args.assignee ?? null }) };
     case 'bus_approve_task': return bus.approveTask(args.id, { by: args.agent, token: args.token ?? null });
     case 'bus_claim_task': return bus.claimTask(args.id, { by: args.agent, token: args.token ?? null });
@@ -58,6 +62,10 @@ export async function callTool(bus, name, args = {}) {
     case 'bus_channels': return { channels: await bus.listChannels() };
     case 'bus_comment_task': return bus.addTaskComment(args.id, { by: args.agent, body: args.body, token: args.token ?? null });
     case 'workspace_delete_file': return bus.deleteFile({ by: args.agent, path: args.path, token: args.token ?? null });
+    case 'bus_sync': return bus.sync({ sinceSeq: args.sinceSeq ?? 0, limit: args.limit ?? 500 });
+    case 'workspace_get_capsule': return bus.getCapsule(args.slug, { create: !!args.create, title: args.title ?? '', by: args.agent ?? null, token: args.token ?? null });
+    case 'workspace_update_capsule': return bus.updateCapsule(args.slug, { by: args.agent, section: args.section, text: args.text, token: args.token ?? null });
+    case 'workspace_file_history': return bus.fileHistory(args.path);
     default: throw Object.assign(new Error(`unknown tool: ${name}`), { code: 'UNKNOWN_TOOL' });
   }
 }

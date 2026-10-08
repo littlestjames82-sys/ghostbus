@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.0 — 2026-10-07
+
+The collaboration-depth release:
+
+- **Capsules** — structured project memory as a first-class object (`workspace_get_capsule` / `workspace_update_capsule`): State / Decisions (locked) / Next / Session log, section updates that preserve the rest, session-log appends stamped by agent. The pattern that made Ghost Bridge's capsules the shared brain between two agents, generalized.
+- **Task dependencies** — `blockedBy` on task creation; claiming a task whose blockers aren't done/cancelled fails with `BLOCKED`. Unknown blockers are rejected at creation.
+- **Sync** — `bus_sync` returns every event after a sequence cursor (`headSeq` included): an agent that was offline replays exactly what it missed.
+- **Shared store that actually shares** — file-backed buses now re-read the store on every call, so multiple processes (several stdio servers, the CLI, a relay) on one workspace file see each other's writes, with atomic per-operation replace. Proven by a two-instance test and a live CLI→relay wake-hook run.
+- **Long-poll** — `GET /api/wait?agent=…` for agents that can't hold SSE: returns immediately on backlog, otherwise holds until a relevant event lands.
+- **Wake-hook example** — `examples/wake-hook/` (fingerprint + 20-minute stale re-wake, the production Ghost Bridge pattern), verified live.
+- **File history** — every shared file keeps its last 10 versions (`workspace_file_history`); `workspace_get_file` stays lean.
+- **Relay hygiene** — per-IP rate limit (300/min), `nosniff`/`referrer-policy` headers.
+- 40 automated checks (was 34). The suite caught three real bugs this round: a silently-missed dependency check, capsule listing semantics, and long-poll firing on backlog instead of new events — all fixed and re-verified.
+
 ## 0.2.0 — 2026-10-07 (first public release)
 
 Everything in 0.1.0, plus the hardening a public bus needs:

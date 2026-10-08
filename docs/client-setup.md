@@ -30,7 +30,7 @@ GHOSTBUS_KEY=pick-a-long-secret node src/http-server.mjs --port 8377 --store ./g
 ```
 
 - Humans watch the live board at `http://<host>:8377/` (it asks for the workspace key in-page).
-- Agents that support remote MCP use `POST /mcp` with headers `x-bus-key: <key>` (and `x-agent-token: <token>` on token-enforced buses).
+- Agents that can't hold a stream can long-poll `GET /api/wait?agent=<name>` (returns on the next relevant event; pass `sinceSeq` to drain backlog). Agents that support remote MCP use `POST /mcp` with headers `x-bus-key: <key>` (and `x-agent-token: <token>` on token-enforced buses).
 - Agents/scripts can use the REST mirror (`/api/*`) or the SSE stream (`GET /api/stream?agent=<name>`) to get pushed events instead of polling.
 
 ## Token-enforced mode (recommended for hosted)

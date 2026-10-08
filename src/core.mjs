@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-export const GHOSTBUS_VERSION = '0.2.0';
+export const GHOSTBUS_VERSION = '0.3.0';
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 export const TASK_STATUSES = ['queued', 'claimed', 'needs-approval', 'done', 'cancelled'];
 const CLAIM_LEASE_MS = 15 * 60 * 1000;
@@ -47,7 +47,7 @@ export class MemoryStore {
 }
 
 export class FileStore {
-  constructor(file) { this.file = file; }
+  constructor(file) { this.file = file; this.shared = true; }
   async load() {
     try { return JSON.parse(await fs.promises.readFile(this.file, 'utf8')); }
     catch { return null; }
@@ -75,8 +75,15 @@ export class GhostBus {
   onEvent(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); }
 
   async init() {
-    if (this.state) return this;
-    this.state = (await this.store.load()) || emptyState(this.workspaceInfo);
+    // Shared (file) stores are re-read on every call: several processes
+    // (stdio servers, the CLI, a relay) can then share ONE workspace file
+    // and actually see each other's writes. Each mutation is a fresh
+    // read-modify-write with an atomic replace, so the race window is a
+    // single operation. Memory stores skip the reload.
+    if (this.state && !this.store.shared) return this;
+    const loaded = await this.store.load();
+    if (loaded) this.state = loaded;
+    else if (!this.state) this.state = emptyState(this.workspaceInfo);
     return this;
   }
 
@@ -204,7 +211,7 @@ export class GhostBus {
   }
 
   // ---------- tasks ----------
-  async createTask({ from, title, body = '', assignee = null, priority = 'normal', needsApproval = false, token = null }) {
+  async createTask({ from, title, body = '', assignee = null, priority = 'normal', needsApproval = false, blockedBy = [], token = null }) {
     await this.init();
     this._requireAgent(from, token);
     if (assignee) this._existsAgent(assignee);
@@ -215,10 +222,11 @@ export class GhostBus {
       from, assignee: assignee || null, priority: priority === 'urgent' ? 'urgent' : 'normal',
       status: needsApproval ? 'needs-approval' : 'queued',
       needsApproval: !!needsApproval, approvedBy: null,
-      claimedBy: null, claimExpiresAt: null, result: null, comments: [],
+      claimedBy: null, claimExpiresAt: null, result: null, comments: [], blockedBy: Array.isArray(blockedBy) ? blockedBy.map(Number).filter(n => n >= 1) : [],
       createdAt: now(), updatedAt: now(),
       history: [{ at: now(), by: from, action: needsApproval ? 'created (awaiting approval)' : 'created' }],
     };
+    for (const b of task.blockedBy) if (!this.state.tasks.some(t => t.id === b)) throw new Error(`blocker task not found: ${b}`);
     this.state.tasks.push(task);
     this._event('task.create', from, `task #${task.id}: ${task.title}`);
     await this._save();
@@ -266,6 +274,8 @@ export class GhostBus {
     if (task.status === 'claimed') throw Object.assign(new Error(`task #${id} already claimed by ${task.claimedBy}`), { code: 'ALREADY_CLAIMED' });
     if (task.status !== 'queued') throw new Error(`task #${id} cannot be claimed (status: ${task.status})`);
     if (task.assignee && task.assignee !== by) throw new Error(`task #${id} is assigned to ${task.assignee}`);
+    const openBlockers = (task.blockedBy || []).filter(bid => { const b = this.state.tasks.find(t => t.id === bid); return b && !['done', 'cancelled'].includes(b.status); });
+    if (openBlockers.length) throw Object.assign(new Error(`task #${id} is blocked by unfinished task(s): ${openBlockers.join(', ')}`), { code: 'BLOCKED' });
     task.status = 'claimed'; task.claimedBy = by;
     task.claimExpiresAt = new Date(Date.now() + CLAIM_LEASE_MS).toISOString();
     task.updatedAt = now();
@@ -312,17 +322,27 @@ export class GhostBus {
     this._requireAgent(by, token);
     if (!p || typeof text !== 'string') throw new Error('path and text required');
     if (String(p).includes('..')) throw new Error('path may not contain ..');
-    this.state.files[p] = { text, updatedBy: by, updatedAt: now() };
+    const prev = this.state.files[p];
+    const history = prev ? [...(prev.history || []), { text: prev.text, updatedBy: prev.updatedBy, updatedAt: prev.updatedAt }].slice(-10) : [];
+    this.state.files[p] = { text, updatedBy: by, updatedAt: now(), history };
     this._event('file.put', by, `${by} wrote ${p} (${text.length} chars)`);
     await this._save();
     return { path: p, bytes: Buffer.byteLength(text) };
   }
 
-  async getFile(p) {
+  async getFile(p, { withHistory = false } = {}) {
     await this.init();
     const f = this.state.files[p];
     if (!f) throw new Error(`file not found: ${p}`);
-    return { path: p, ...clone(f) };
+    const { history, ...rest } = f;
+    return { path: p, ...clone(rest), versions: (history || []).length + 1, ...(withHistory ? { history: clone(history || []) } : {}) };
+  }
+
+  async fileHistory(p) {
+    await this.init();
+    const f = this.state.files[p];
+    if (!f) throw new Error(`file not found: ${p}`);
+    return { path: p, current: { text: f.text, updatedBy: f.updatedBy, updatedAt: f.updatedAt }, history: clone(f.history || []) };
   }
 
   async listFiles() {
@@ -393,6 +413,62 @@ export class GhostBus {
     };
   }
 
+
+  _capsulePath(slug) {
+    if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(String(slug))) throw new Error('capsule slug: lowercase letters, digits, - only');
+    return `capsules/${slug}.md`;
+  }
+
+  _capsuleTemplate(slug, title) {
+    return `# Capsule: ${title || slug}\n\n## State\n\n## Decisions (locked)\n\n## Next\n\n## Session log\n`;
+  }
+
+  /** Read a project capsule, creating it from the template on first touch when create=true. */
+  async getCapsule(slug, { create = false, title = '', by = null, token = null } = {}) {
+    await this.init();
+    const pth = this._capsulePath(slug);
+    if (!this.state.files[pth]) {
+      if (!create) throw new Error(`capsule not found: ${slug}`);
+      if (by) this._requireAgent(by, token);
+      this.state.files[pth] = { text: this._capsuleTemplate(slug, title), updatedBy: by || 'system', updatedAt: now(), history: [] };
+      this._event('capsule.create', by || 'system', `capsule ${slug} created`);
+      await this._save();
+    }
+    return this.getFile(pth);
+  }
+
+  /** Replace one capsule section (State / Decisions / Next) or append to the Session log. */
+  async updateCapsule(slug, { by, section, text, token = null }) {
+    await this.init();
+    this._requireAgent(by, token);
+    await this.getCapsule(slug, { create: true, by, token });
+    const pth = this._capsulePath(slug);
+    const cur = this.state.files[pth].text;
+    const SECTIONS = ['State', 'Decisions (locked)', 'Next', 'Session log'];
+    if (!SECTIONS.includes(section)) throw new Error(`section must be one of: ${SECTIONS.join(' | ')}`);
+    const marker = `## ${section}`;
+    const start = cur.indexOf(marker);
+    if (start < 0) throw new Error(`capsule ${slug} is missing section ${section}`);
+    const afterHead = start + marker.length;
+    const rest = cur.slice(afterHead);
+    const nextIdx = rest.indexOf('\n## ');
+    const tail = nextIdx >= 0 ? rest.slice(nextIdx) : '';
+    const entry = section === 'Session log'
+      ? `${rest.trimEnd() ? rest.replace(/\s+$/, '') + '\n' : '\n'}- ${now()} · ${by} — ${String(text).trim()}\n`
+      : `\n\n${String(text).trim()}\n`;
+    const updated = cur.slice(0, afterHead) + entry + tail.replace(/^\n+/, tail ? '\n' : '');
+    const prev = this.state.files[pth];
+    this.state.files[pth] = { text: updated.endsWith('\n') ? updated : updated + '\n', updatedBy: by, updatedAt: now(), history: [...(prev.history || []), { text: prev.text, updatedBy: prev.updatedBy, updatedAt: prev.updatedAt }].slice(-10) };
+    this._event('capsule.update', by, `${by} updated capsule ${slug} [${section}]`, { capsule: slug });
+    await this._save();
+    return this.getFile(pth);
+  }
+
+  async listCapsules() {
+    await this.init();
+    return Object.keys(this.state.files).filter(p => p.startsWith('capsules/') && p.endsWith('.md')).map(p => p.slice('capsules/'.length, -3)).sort();
+  }
+
   /** A human-readable board rendered from live state — the shared picture at a glance. */
   async board() {
     await this.init();
@@ -418,6 +494,14 @@ export class GhostBus {
       '',
     ];
     return lines.join('\n');
+  }
+
+  /** Catch-up sync: every event after `sinceSeq`, plus the current head seq.
+   *  An agent that was offline replays exactly what it missed — nothing more. */
+  async sync({ sinceSeq = 0, limit = 500 } = {}) {
+    await this.init();
+    const evs = this.state.events.filter(e => e.seq > Number(sinceSeq));
+    return { events: clone(evs.slice(0, Math.min(limit, 1000))), headSeq: this.state.seq, truncated: evs.length > Math.min(limit, 1000) };
   }
 
   async events({ limit = 50 } = {}) {

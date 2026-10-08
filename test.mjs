@@ -181,6 +181,54 @@ await check('token rotation invalidates the old token', async () => {
   aliceToken = rot.token;
 });
 
+await check('task dependencies: claim refused until blocker done', async () => {
+  const blocker = await bus.createTask({ from: 'planner', title: 'Blocker' });
+  const dependent = await bus.createTask({ from: 'planner', title: 'Dependent', blockedBy: [blocker.id] });
+  await assert.rejects(() => bus.claimTask(dependent.id, { by: 'builder' }), /blocked by unfinished/);
+  await bus.claimTask(blocker.id, { by: 'builder' });
+  await bus.completeTask(blocker.id, { by: 'builder', result: 'unblocked' });
+  assert.equal((await bus.claimTask(dependent.id, { by: 'builder' })).status, 'claimed');
+  await assert.rejects(() => bus.createTask({ from: 'planner', title: 'Bad deps', blockedBy: [9999] }), /blocker task not found/);
+});
+await check('capsules: template, section update preserves others, session log appends', async () => {
+  const c0 = await bus.getCapsule('demo-proj', { create: true, by: 'planner', title: 'Demo Proj' });
+  for (const h of ['## State', '## Decisions (locked)', '## Next', '## Session log']) assert.ok(c0.text.includes(h), 'missing ' + h);
+  await bus.updateCapsule('demo-proj', { by: 'planner', section: 'State', text: 'API half built.' });
+  await bus.updateCapsule('demo-proj', { by: 'builder', section: 'Decisions (locked)', text: 'Node only, zero deps.' });
+  await bus.updateCapsule('demo-proj', { by: 'builder', section: 'Session log', text: 'Finished endpoints.' });
+  await bus.updateCapsule('demo-proj', { by: 'planner', section: 'Session log', text: 'Reviewed.' });
+  const c = await bus.getCapsule('demo-proj');
+  assert.match(c.text, /API half built/);
+  assert.match(c.text, /Node only, zero deps/);
+  assert.match(c.text, /Finished endpoints/);
+  assert.match(c.text, /Reviewed/);
+  assert.ok((c.text.match(/## State/g) || []).length === 1, 'section duplicated');
+  assert.ok((await bus.listCapsules()).includes('demo-proj'));
+  await assert.rejects(() => bus.updateCapsule('demo-proj', { by: 'planner', section: 'Bogus', text: 'x' }), /section must be one of/);
+  await assert.rejects(() => bus.getCapsule('../evil'), /slug/);
+});
+await check('sync: cursor replays exactly the events after it', async () => {
+  const head = (await bus.sync({})).headSeq;
+  await bus.sendMessage({ from: 'planner', to: '*', body: 'sync marker msg' });
+  const t = await bus.createTask({ from: 'planner', title: 'Sync marker task' });
+  await bus.cancelTask(t.id, { by: 'planner' });
+  const replay = await bus.sync({ sinceSeq: head });
+  assert.equal(replay.events.length, 3);
+  assert.ok(replay.events.every(e => e.seq > head));
+  assert.equal(replay.headSeq, head + 3);
+  assert.equal((await bus.sync({ sinceSeq: replay.headSeq })).events.length, 0);
+});
+await check('file history: versions kept, getFile stays lean', async () => {
+  await bus.putFile({ by: 'planner', path: 'versioned.txt', text: 'v1' });
+  await bus.putFile({ by: 'builder', path: 'versioned.txt', text: 'v2' });
+  await bus.putFile({ by: 'builder', path: 'versioned.txt', text: 'v3' });
+  const f = await bus.getFile('versioned.txt');
+  assert.equal(f.text, 'v3'); assert.equal(f.versions, 3); assert.ok(!('history' in f));
+  const h = await bus.fileHistory('versioned.txt');
+  assert.equal(h.history.length, 2); assert.equal(h.history[0].text, 'v1'); assert.equal(h.history[1].text, 'v2');
+  assert.equal(h.current.text, 'v3');
+});
+
 /* ---------------- persistence ---------------- */
 console.log('persistence:');
 await check('FileStore survives a reload (new bus instance, same file)', async () => {
@@ -193,10 +241,22 @@ await check('FileStore survives a reload (new bus instance, same file)', async (
   assert.equal((await b2.inbox('solo', { markRead: false })).length, 1);
 });
 
+await check('two bus instances on one file store see each other (multi-process sharing)', async () => {
+  const file = path.join(tmp, 'shared.json');
+  const a = await createBus(new FileStore(file), { name: 'Shared' });
+  const b = await createBus(new FileStore(file), { name: 'Shared' });
+  await a.registerAgent({ name: 'proc-a' });
+  await b.registerAgent({ name: 'proc-b' }); // b must not clobber a's registration
+  assert.equal((await a.listAgents()).length, 2);
+  await a.sendMessage({ from: 'proc-a', to: 'proc-b', body: 'cross-process hello' });
+  const inbox = await b.inbox('proc-b', { markRead: false });
+  assert.equal(inbox.length, 1); assert.match(inbox[0].body, /cross-process/);
+});
+
 /* ---------------- MCP tools layer ---------------- */
 console.log('mcp tools:');
-await check('tool list has 25 tools with schemas', async () => {
-  assert.equal(TOOLS.length, 25);
+await check('tool list has 29 tools with schemas', async () => {
+  assert.equal(TOOLS.length, 29);
   for (const t of TOOLS) { assert.ok(t.name && t.description && t.inputSchema, t.name); }
 });
 await check('callTool dispatch + unknown tool error', async () => {
@@ -225,7 +285,7 @@ await check('stdio server: initialize, tools/list, register+send+inbox across tw
   const init = await rpc('initialize', {});
   assert.equal(init.result.serverInfo.name, 'ghostbus');
   const list = await rpc('tools/list', {});
-  assert.equal(list.result.tools.length, 25);
+  assert.equal(list.result.tools.length, 29);
   const reg = await rpc('tools/call', { name: 'bus_register', arguments: { agent: 'stdio-alice', role: 'tester' } });
   assert.ok(!reg.result.isError, JSON.stringify(reg));
   await rpc('tools/call', { name: 'bus_register', arguments: { agent: 'stdio-bob', role: 'tester' } });
@@ -313,6 +373,30 @@ await check('cli: register/send/board from the shell', async () => {
   await run('node', ['src/cli.mjs', '--store', storeFile, 'send', 'cli-alice', 'cli-bob', 'hello from cli'], { cwd });
   const { stdout } = await run('node', ['src/cli.mjs', '--store', storeFile, 'board'], { cwd });
   assert.match(stdout, /cli-alice/);
+});
+
+await check('http: long-poll /api/wait delivers, capsules + sync over REST, security headers', async () => {
+  const storeFile = path.join(tmp, 'wait.json');
+  const proc = spawn('node', ['src/http-server.mjs', '--port', '18380', '--store', storeFile], { cwd: new URL('.', import.meta.url).pathname, stdio: ['ignore', 'pipe', 'pipe'] });
+  const H = { 'content-type': 'application/json' };
+  try {
+    for (let i = 0; i < 50; i++) { try { const r = await fetch('http://127.0.0.1:18380/health'); if (r.ok) { assert.equal(r.headers.get('x-content-type-options'), 'nosniff'); break; } } catch {} await new Promise(r => setTimeout(r, 100)); }
+    await fetch('http://127.0.0.1:18380/api/agents', { method: 'POST', headers: H, body: JSON.stringify({ agent: 'waiter' }) });
+    await fetch('http://127.0.0.1:18380/api/agents', { method: 'POST', headers: H, body: JSON.stringify({ agent: 'sender2' }) });
+    const waitP = fetch('http://127.0.0.1:18380/api/wait?agent=waiter&timeout=10').then(r => r.json());
+    await new Promise(r => setTimeout(r, 300));
+    await fetch('http://127.0.0.1:18380/api/messages', { method: 'POST', headers: H, body: JSON.stringify({ agent: 'sender2', to: 'waiter', body: 'long-poll hello' }) });
+    const waited = await waitP;
+    assert.equal(waited.waited, true);
+    assert.ok(waited.events.some(e => e.type === 'message.send'));
+    const quick = await (await fetch('http://127.0.0.1:18380/api/wait?agent=waiter&timeout=1&sinceSeq=0')).json();
+    assert.ok(quick.events.length >= 1 && quick.waited === false);
+    await fetch('http://127.0.0.1:18380/api/capsules/rest-proj/section', { method: 'POST', headers: H, body: JSON.stringify({ agent: 'sender2', section: 'Next', text: 'Ship it.' }) });
+    const cap = await (await fetch('http://127.0.0.1:18380/api/capsules/rest-proj')).json();
+    assert.match(cap.text, /Ship it/);
+    const sync = await (await fetch('http://127.0.0.1:18380/api/sync?sinceSeq=0')).json();
+    assert.ok(sync.headSeq >= 3 && sync.events.length >= 3);
+  } finally { proc.kill(); }
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

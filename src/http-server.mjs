@@ -30,6 +30,17 @@ const BOARD_HTML = fs.readFileSync(new URL('./board.html', import.meta.url), 'ut
 const agentTokenOf = (req, body = {}, q = {}) =>
   body.token || q.token || req.headers['x-agent-token'] || null;
 
+// Lightweight per-IP token bucket (relay hygiene, not a WAF): 300 req/min/IP.
+const buckets = new Map();
+const rateOk = (req) => {
+  const ip = req.socket.remoteAddress || 'unknown';
+  const t = Date.now();
+  let b = buckets.get(ip);
+  if (!b || t - b.start > 60_000) { b = { start: t, count: 0 }; buckets.set(ip, b); }
+  b.count += 1;
+  return b.count <= 300;
+};
+
 const keyOk = (req) => {
   if (!KEY) return true;
   const given = req.headers['x-bus-key'] || String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
@@ -40,6 +51,9 @@ const keyOk = (req) => {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
+  res.setHeader('x-content-type-options', 'nosniff');
+  res.setHeader('referrer-policy', 'no-referrer');
+  if (!rateOk(req) && url.pathname !== '/health' && url.pathname !== '/probe') return (() => { res.writeHead(429, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'rate limit: 300 requests/min per IP' })); })();
   const send = (status, obj, type = 'application/json') => {
     const body = type === 'application/json' ? JSON.stringify(obj) : String(obj);
     res.writeHead(status, { 'content-type': type }); res.end(body);
@@ -75,6 +89,30 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // Long-poll: hold the request until an event relevant to this agent lands
+    // (or timeout). For agents that can't hold an SSE stream open.
+    if (req.method === 'GET' && url.pathname === '/api/wait') {
+      const agent = url.searchParams.get('agent');
+      if (!agent) return send(400, { error: 'agent query param required' });
+      const timeout = Math.min(Number(url.searchParams.get('timeout') || 25), 55) * 1000;
+      // No cursor given = "wake me for NEW events": start from the current head.
+      const sinceSeq = url.searchParams.has('sinceSeq') ? Number(url.searchParams.get('sinceSeq')) : (await bus.sync({})).headSeq;
+      const immediate = await bus.sync({ sinceSeq, limit: 100 });
+      const relevantNow = immediate.events.filter(ev => ev.type !== 'message.send' || ev.to === agent || ev.to === '*' || ev.actor === agent);
+      if (relevantNow.length) return send(200, { events: relevantNow, headSeq: immediate.headSeq, waited: false });
+      return await new Promise((resolve) => {
+        let done = false;
+        const finish = (events) => { if (done) return; done = true; off(); clearTimeout(timer); resolve(send(200, { events, headSeq: events.length ? events[events.length - 1].seq : sinceSeq, waited: true })); };
+        const off = bus.onEvent((ev) => {
+          if (ev.seq <= sinceSeq) return;
+          if (ev.type === 'message.send' && !(ev.to === agent || ev.to === '*' || ev.actor === agent)) return;
+          finish([ev]);
+        });
+        const timer = setTimeout(() => finish([]), timeout);
+        req.on('close', () => { if (!done) { done = true; off(); clearTimeout(timer); resolve(); } });
+      });
+    }
+
     // MCP over HTTP (single JSON-RPC endpoint, same tools as stdio)
     if (req.method === 'POST' && url.pathname === '/mcp') {
       const msg = await readBody();
@@ -105,7 +143,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/heartbeat') return send(200, await bus.heartbeat({ name: body.agent, token: agentTokenOf(req, body) }));
     if (req.method === 'GET' && url.pathname === '/api/search') return send(200, await bus.search(q.q || '', { limit: Number(q.limit || 20) }));
     if (req.method === 'GET' && url.pathname === '/api/channels') return send(200, { channels: await bus.listChannels() });
-    if (req.method === 'POST' && url.pathname === '/api/tasks') return send(200, await bus.createTask({ from: body.agent, title: body.title, body: body.body ?? '', assignee: body.assignee ?? null, priority: body.priority ?? 'normal', needsApproval: !!body.needsApproval, token: agentTokenOf(req, body) }));
+    if (req.method === 'POST' && url.pathname === '/api/tasks') return send(200, await bus.createTask({ from: body.agent, title: body.title, body: body.body ?? '', assignee: body.assignee ?? null, priority: body.priority ?? 'normal', needsApproval: !!body.needsApproval, blockedBy: body.blockedBy ?? [], token: agentTokenOf(req, body) }));
     if (req.method === 'GET' && url.pathname === '/api/tasks') return send(200, { tasks: await bus.listTasks({ status: q.status || null, assignee: q.assignee || null }) });
     const taskAction = url.pathname.match(/^\/api\/tasks\/(\d+)\/(approve|claim|complete|cancel)$/);
     if (req.method === 'POST' && taskAction) {
@@ -126,6 +164,13 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/context') return send(200, await bus.getContext());
     if (req.method === 'GET' && url.pathname === '/api/board') return send(200, { board: await bus.board() }, 'application/json');
     if (req.method === 'GET' && url.pathname === '/api/events') return send(200, { events: await bus.events({ limit: Number(q.limit || 50) }) });
+    if (req.method === 'GET' && url.pathname === '/api/sync') return send(200, await bus.sync({ sinceSeq: Number(q.sinceSeq || 0), limit: Number(q.limit || 500) }));
+    if (req.method === 'GET' && url.pathname === '/api/capsules') return send(200, { capsules: await bus.listCapsules() });
+    const capsuleGet = url.pathname.match(/^\/api\/capsules\/([a-z0-9-]+)$/);
+    if (req.method === 'GET' && capsuleGet) return send(200, await bus.getCapsule(capsuleGet[1], { create: q.create === '1', by: q.agent || null }));
+    const capsulePut = url.pathname.match(/^\/api\/capsules\/([a-z0-9-]+)\/section$/);
+    if (req.method === 'POST' && capsulePut) return send(200, await bus.updateCapsule(capsulePut[1], { by: body.agent, section: body.section, text: body.text, token: agentTokenOf(req, body) }));
+    if (req.method === 'GET' && url.pathname === '/api/files/history') return send(200, await bus.fileHistory(q.path));
 
     return send(404, { error: 'not found' });
   } catch (e) {

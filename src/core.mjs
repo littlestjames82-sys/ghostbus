@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-export const GHOSTBUS_VERSION = '0.4.1';
+export const GHOSTBUS_VERSION = '0.5.0';
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 export const TASK_STATUSES = ['queued', 'claimed', 'needs-approval', 'done', 'cancelled'];
 const CLAIM_LEASE_MS = 15 * 60 * 1000;
@@ -536,6 +536,41 @@ export class GhostBus {
       events: s.events.length,
     };
   }
+
+  /** Full-state snapshot for backup / migration. The state holds agent token
+   *  HASHES only, never plaintext secrets; workspace keys live outside the
+   *  state (hosted registry) and are never part of a snapshot. */
+  async snapshot() {
+    await this.init();
+    return clone(this.state);
+  }
+
+  /** Replace this workspace's state with a snapshot (restore / import).
+   *  The snapshot is shape-validated, the workspace identity is preserved
+   *  unless the snapshot carries one, and the restore itself is recorded
+   *  in the provenance log. Returns the post-restore status. */
+  async restore(snapshot, { by = 'operator' } = {}) {
+    await this.init();
+    const bad = validateSnapshot(snapshot);
+    if (bad) throw Object.assign(new Error(`invalid snapshot: ${bad}`), { code: 'BAD_SNAPSHOT' });
+    const next = clone(snapshot);
+    next.workspace = { ...next.workspace, id: this.state.workspace.id, name: next.workspace.name || this.state.workspace.name };
+    this.state = next;
+    this._event('workspace.restore', by, `workspace restored from snapshot (${next.agents.length} agents, ${next.tasks.length} tasks, ${next.messages.length} messages)`);
+    await this._save();
+    return this.status();
+  }
+}
+
+/** Shape-check a candidate workspace snapshot. Returns null when valid,
+ *  otherwise a short description of the first problem found. */
+export function validateSnapshot(s) {
+  if (!s || typeof s !== 'object' || Array.isArray(s)) return 'not an object';
+  if (!s.workspace || typeof s.workspace !== 'object') return 'missing workspace';
+  for (const k of ['seq', 'msgSeq', 'taskSeq']) if (typeof s[k] !== 'number') return `missing numeric ${k}`;
+  for (const k of ['agents', 'messages', 'tasks', 'events']) if (!Array.isArray(s[k])) return `missing array ${k}`;
+  if (!s.files || typeof s.files !== 'object' || Array.isArray(s.files)) return 'missing files object';
+  return null;
 }
 
 export async function createBus(store, workspace, opts = {}) {

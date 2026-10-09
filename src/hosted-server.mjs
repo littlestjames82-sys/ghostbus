@@ -14,6 +14,9 @@
  *     POST   /api/workspaces {id?, name}   -> {id, name, key (once)}
  *     GET    /api/workspaces               -> [{id, name, createdAt, agents, queued}]
  *     DELETE /api/workspaces/<id>          -> removes registry entry + data file
+ *     POST   /api/workspaces/<id>/rotate-key -> {id, key (once)}; old key dies at once
+ *     GET    /api/workspaces/<id>/export   -> full-state export envelope (backup/migrate)
+ *     POST   /api/workspaces/import {id?, name?, state|export} -> {id, name, key (once)}
  * - Registry + one data file per workspace live in the data dir.
  *   Set GHOSTBUS_REQUIRE_TOKENS=1 to enforce per-agent tokens in all workspaces.
  */
@@ -21,7 +24,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { createBus, FileStore, GHOSTBUS_VERSION } from './core.mjs';
+import { createBus, FileStore, GHOSTBUS_VERSION, validateSnapshot } from './core.mjs';
 import { createBusHandler, keyMatches } from './handler.mjs';
 
 const argv = process.argv.slice(2);
@@ -129,6 +132,57 @@ const server = http.createServer(async (req, res) => {
         out.push({ id, name: meta.name, createdAt: meta.createdAt, agents: s.agents, queued: s.tasks.queued, needsApproval: s.tasks.needsApproval, messages: s.messages });
       }
       return send(200, { workspaces: out });
+    }
+    const rotateMatch = url.pathname.match(/^\/api\/workspaces\/([a-z0-9-]+)\/rotate-key$/);
+    if (req.method === 'POST' && rotateMatch) {
+      if (!isAdmin(req)) return send(401, { error: 'admin key required' });
+      const reg = loadRegistry();
+      const id = rotateMatch[1];
+      if (!reg.workspaces[id]) return send(404, { error: `no such workspace: ${id}` });
+      const key = crypto.randomBytes(24).toString('hex');
+      reg.workspaces[id].keyHash = sha256(key);
+      reg.workspaces[id].keyRotatedAt = new Date().toISOString();
+      saveRegistry(reg);
+      // Refresh the cached meta so the old key dies immediately, not on restart.
+      const cached = buses.get(id);
+      if (cached) cached.meta = reg.workspaces[id];
+      return send(200, { id, key, keyNote: 'New workspace key — shown ONCE. The previous key is invalid from this moment.', keyRotatedAt: reg.workspaces[id].keyRotatedAt });
+    }
+    const exportMatch = url.pathname.match(/^\/api\/workspaces\/([a-z0-9-]+)\/export$/);
+    if (req.method === 'GET' && exportMatch) {
+      if (!isAdmin(req)) return send(401, { error: 'admin key required' });
+      const id = exportMatch[1];
+      const w = await getWorkspace(id);
+      if (!w) return send(404, { error: `no such workspace: ${id}` });
+      const state = await w.bus.snapshot();
+      return send(200, { ghostbusExport: 1, version: GHOSTBUS_VERSION, exportedAt: new Date().toISOString(), workspace: { id, name: w.meta.name }, state });
+    }
+    if (url.pathname === '/api/workspaces/import' && req.method === 'POST') {
+      if (!isAdmin(req)) return send(401, { error: 'admin key required' });
+      const body = await readBody();
+      if (!body) return send(400, { error: 'invalid JSON body' });
+      // Accept either a full export envelope or a bare {state} / raw state.
+      const env = body.ghostbusExport ? body : null;
+      const state = env ? env.state : (body.state || body);
+      const bad = validateSnapshot(state);
+      if (bad) return send(400, { error: `invalid snapshot: ${bad}` });
+      const reg = loadRegistry();
+      const id = body.id || (env && env.workspace && env.workspace.id) || state.workspace.id || `ws-${crypto.randomBytes(4).toString('hex')}`;
+      if (!validId(id)) return send(400, { error: 'workspace id: lowercase letters, digits, - (2-63 chars)' });
+      if (reg.workspaces[id]) return send(409, { error: `workspace already exists: ${id} (delete it first, or import under a new id)` });
+      const name = String(body.name || (env && env.workspace && env.workspace.name) || state.workspace.name || id).slice(0, 120);
+      const key = crypto.randomBytes(24).toString('hex');
+      reg.workspaces[id] = { name, keyHash: sha256(key), createdAt: new Date().toISOString(), importedAt: new Date().toISOString() };
+      saveRegistry(reg);
+      // Write the state file first, then load it through the normal path so
+      // the bus sees exactly what a restart would see.
+      const file = path.join(dataDir, `${id}.json`);
+      const tmp = file + '.tmp.' + process.pid + '.' + Math.random().toString(36).slice(2, 10);
+      fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+      fs.renameSync(tmp, file);
+      const w = await getWorkspace(id);
+      const status = await w.bus.status();
+      return send(201, { id, name, key, keyNote: 'Workspace key — shown ONCE, only its hash is stored. Imported workspaces always get a FRESH key; the source key is not carried over.', agents: status.agents, messages: status.messages, tasks: status.tasks.total, board: `/w/${id}/` });
     }
     const delMatch = url.pathname.match(/^\/api\/workspaces\/([a-z0-9-]+)$/);
     if (req.method === 'DELETE' && delMatch) {

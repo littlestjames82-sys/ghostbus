@@ -253,6 +253,39 @@ await check('two bus instances on one file store see each other (multi-process s
   assert.equal(inbox.length, 1); assert.match(inbox[0].body, /cross-process/);
 });
 
+await check('concurrent FileStore saves never collide (v0.4.1 race regression)', async () => {
+  // Pre-fix, FileStore.save wrote one fixed '<file>.tmp' then renamed it:
+  // concurrent writers collided and most saves failed ENOENT (59/60 in the
+  // standalone stress proof). Two store instances on one file, 60 saves
+  // in flight at once: all must resolve and the file must stay valid JSON.
+  const file = path.join(tmp, 'race.json');
+  const s1 = new FileStore(file), s2 = new FileStore(file);
+  const state = (n) => ({ workspace: { id: 'race', name: 'Race' }, seq: n, msgSeq: 0, taskSeq: 0, agents: [], messages: [], tasks: [], files: {}, context: null, events: [] });
+  const jobs = [];
+  for (let i = 0; i < 60; i++) jobs.push((i % 2 ? s1 : s2).save(state(i)));
+  await Promise.all(jobs); // any ENOENT rejects here and fails the check
+  const final = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(typeof final.seq, 'number');
+  assert.equal(fs.readdirSync(tmp).filter(f => f.includes('.tmp.')).length, 0, 'temp files left behind');
+});
+
+await check('snapshot -> restore round-trip preserves the workspace; bad snapshot refused', async () => {
+  const src = await createBus(new MemoryStore(), { name: 'Snap Source' });
+  await src.registerAgent({ name: 'snapper' });
+  await src.createTask({ from: 'snapper', title: 'Snapshot me' });
+  await src.putFile({ by: 'snapper', path: 'note.md', text: 'in the snapshot' });
+  const snap = await src.snapshot();
+  assert.ok(!JSON.stringify(snap).includes('"key"'), 'snapshot must not carry workspace keys');
+  const dst = await createBus(new MemoryStore(), { name: 'Snap Target' });
+  const st = await dst.restore(JSON.parse(JSON.stringify(snap)), { by: 'test' });
+  assert.equal(st.agents, 1); assert.equal(st.tasks.total, 1); assert.equal(st.files, 1);
+  assert.match((await dst.getFile('note.md')).text, /in the snapshot/);
+  const evs = await dst.events({ limit: 5 });
+  assert.ok(evs.some(e => e.type === 'workspace.restore'), 'restore is in the provenance log');
+  await assert.rejects(() => dst.restore({ nope: true }), /invalid snapshot/);
+  await assert.rejects(() => dst.restore(null), /invalid snapshot/);
+});
+
 /* ---------------- MCP tools layer ---------------- */
 console.log('mcp tools:');
 await check('tool list has 29 tools with schemas', async () => {
@@ -451,6 +484,45 @@ await check('hosted: admin-gated creation, per-workspace keys, full isolation, M
     assert.equal((await fetch('http://127.0.0.1:18382/w/beta/api/status', { headers: KB })).status, 404);
     // unknown workspace 404
     assert.equal((await fetch('http://127.0.0.1:18382/w/nope/probe')).status, 404);
+  } finally { proc.kill(); }
+});
+
+await check('hosted operator: rotate-key kills the old key; export -> delete -> import restores with a fresh key', async () => {
+  const dataDir = path.join(tmp, 'hosted-ops');
+  const env = { ...process.env, GHOSTBUS_ADMIN_KEY: 'ops-admin-456' };
+  const proc = spawn('node', ['src/hosted-server.mjs', '--port', '18383', '--data-dir', dataDir], { cwd: new URL('.', import.meta.url).pathname, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const A = { 'content-type': 'application/json', 'x-bus-key': 'ops-admin-456' };
+  const J = (r) => r.json();
+  try {
+    for (let i = 0; i < 50; i++) { try { const r = await fetch('http://127.0.0.1:18383/health'); if (r.ok) break; } catch {} await new Promise(r => setTimeout(r, 100)); }
+    const c = await J(await fetch('http://127.0.0.1:18383/api/workspaces', { method: 'POST', headers: A, body: JSON.stringify({ id: 'ops', name: 'Ops Team' }) }));
+    const K1 = { 'content-type': 'application/json', 'x-bus-key': c.key };
+    await fetch('http://127.0.0.1:18383/w/ops/api/agents', { method: 'POST', headers: K1, body: JSON.stringify({ agent: 'ops-agent', role: 'o' }) });
+    await fetch('http://127.0.0.1:18383/w/ops/api/tasks', { method: 'POST', headers: K1, body: JSON.stringify({ agent: 'ops-agent', title: 'Ops task' }) });
+    // rotate: admin-only, old key dies immediately, new key works
+    assert.equal((await fetch('http://127.0.0.1:18383/api/workspaces/ops/rotate-key', { method: 'POST', headers: K1, body: '{}' })).status, 401);
+    const rot = await J(await fetch('http://127.0.0.1:18383/api/workspaces/ops/rotate-key', { method: 'POST', headers: A, body: '{}' }));
+    assert.ok(rot.key && rot.key !== c.key);
+    assert.equal((await fetch('http://127.0.0.1:18383/w/ops/api/status', { headers: K1 })).status, 401);
+    const K2 = { 'content-type': 'application/json', 'x-bus-key': rot.key };
+    assert.equal((await fetch('http://127.0.0.1:18383/w/ops/api/status', { headers: K2 })).status, 200);
+    // export: admin-only, envelope carries state but never a workspace key
+    assert.equal((await fetch('http://127.0.0.1:18383/api/workspaces/ops/export', { headers: K2 })).status, 401);
+    const exp = await J(await fetch('http://127.0.0.1:18383/api/workspaces/ops/export', { headers: A }));
+    assert.equal(exp.ghostbusExport, 1);
+    assert.equal(exp.state.tasks.length, 1);
+    assert.ok(!('key' in exp) && !('keyHash' in exp.state), 'export must not contain the workspace key');
+    // delete, then import the export under the same id: data back, FRESH key
+    assert.equal((await fetch('http://127.0.0.1:18383/api/workspaces/ops', { method: 'DELETE', headers: A })).status, 200);
+    const imp = await J(await fetch('http://127.0.0.1:18383/api/workspaces/import', { method: 'POST', headers: A, body: JSON.stringify(exp) }));
+    assert.ok(imp.key && imp.key !== rot.key && imp.key !== c.key);
+    assert.equal(imp.tasks, 1); assert.equal(imp.agents, 1);
+    const K3 = { 'content-type': 'application/json', 'x-bus-key': imp.key };
+    const tasks = await J(await fetch('http://127.0.0.1:18383/w/ops/api/tasks', { headers: K3 }));
+    assert.equal(tasks.tasks.length, 1); assert.equal(tasks.tasks[0].title, 'Ops task');
+    // importing over an existing id is refused; garbage snapshots refused
+    assert.equal((await fetch('http://127.0.0.1:18383/api/workspaces/import', { method: 'POST', headers: A, body: JSON.stringify(exp) })).status, 409);
+    assert.equal((await fetch('http://127.0.0.1:18383/api/workspaces/import', { method: 'POST', headers: A, body: JSON.stringify({ id: 'junk', state: { nope: 1 } }) })).status, 400);
   } finally { proc.kill(); }
 });
 

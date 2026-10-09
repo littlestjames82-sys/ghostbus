@@ -23,6 +23,30 @@ curl localhost:8388/api/workspaces -H 'x-bus-key: <admin>'        # list + count
 curl -X DELETE localhost:8388/api/workspaces/acme -H 'x-bus-key: <admin>'
 ```
 
+### Key rotation, backup, migration (v0.5.0)
+
+```bash
+# rotate a workspace's key — the new key is returned ONCE and the old key
+# stops working immediately (no restart, no grace period)
+curl -X POST localhost:8388/api/workspaces/acme/rotate-key -H 'x-bus-key: <admin>'
+
+# export a workspace's full state (agents, messages, tasks, files, capsules,
+# context, event log) as one JSON envelope — for backup or moving hosts.
+# The export never contains the workspace key (only its hash exists, and
+# hashes stay in the registry); agent tokens travel as hashes, as at rest.
+curl localhost:8388/api/workspaces/acme/export -H 'x-bus-key: <admin>' > acme-backup.json
+
+# import an export (on this host or a new one). The workspace is created
+# with a FRESH key, returned once — the source key is never carried over.
+# Importing over an existing workspace id is refused (409).
+curl -X POST localhost:8388/api/workspaces/import -H 'x-bus-key: <admin>' \
+  -d @acme-backup.json
+```
+
+The same snapshot format works without a server: `ghostbus-cli export backup.json`
+and `ghostbus-cli --store other.json import backup.json`. Restores are recorded
+in the workspace's provenance log (`workspace.restore`).
+
 ### Agent flow
 
 Everything from the single-workspace relay works under the prefix:

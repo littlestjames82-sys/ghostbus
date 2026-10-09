@@ -11,11 +11,13 @@
  *   ghostbus-cli tasks [--status queued]
  *   ghostbus-cli claim 1 bob | complete 1 bob "done, tests green" | comment 1 alice "note"
  *   ghostbus-cli board | agents | search "API" | put-file alice path.md ./local.md | get-file path.md
+ *   ghostbus-cli export ./backup.json            (full-state snapshot to a file, or stdout with -)
+ *   ghostbus-cli import ./backup.json            (restore a snapshot INTO this store — replaces state)
  *
  * Env: GHOSTBUS_STORE, GHOSTBUS_TOKEN_<AGENT> for token-enforced buses.
  */
 import fs from 'node:fs';
-import { createBus, MemoryStore, FileStore } from './core.mjs';
+import { createBus, MemoryStore, FileStore, GHOSTBUS_VERSION } from './core.mjs';
 
 const argv = process.argv.slice(2);
 const storeIdx = argv.indexOf('--store');
@@ -53,8 +55,23 @@ try {
     case 'put-file': out(await bus.putFile({ by: positional[0], path: positional[1], text: fs.readFileSync(positional[2], 'utf8'), token: tokenFor(positional[0]) })); break;
     case 'get-file': { const f = await bus.getFile(positional[0]); out(f.text); break; }
     case 'events': out(await bus.events({ limit: Number(flagVal('--limit') || 20) })); break;
+    case 'export': {
+      const env = { ghostbusExport: 1, version: GHOSTBUS_VERSION, exportedAt: new Date().toISOString(), workspace: (await bus.status()).workspace, state: await bus.snapshot() };
+      const text = JSON.stringify(env, null, 2);
+      if (!positional[0] || positional[0] === '-') console.log(text);
+      else { fs.writeFileSync(positional[0], text); console.error(`exported ${env.state.agents.length} agents, ${env.state.tasks.length} tasks, ${env.state.messages.length} messages -> ${positional[0]}`); }
+      break;
+    }
+    case 'import': {
+      if (!positional[0]) { console.error('usage: ghostbus-cli import <backup.json>'); process.exit(2); }
+      const parsed = JSON.parse(fs.readFileSync(positional[0], 'utf8'));
+      const state = parsed.ghostbusExport ? parsed.state : (parsed.state || parsed);
+      const st = await bus.restore(state, { by: 'cli' });
+      out({ imported: true, agents: st.agents, messages: st.messages, tasks: st.tasks.total });
+      break;
+    }
     default:
-      console.error('usage: ghostbus-cli [--store file] <status|agents|register|send|inbox|task|tasks|claim|approve|complete|comment|board|search|put-file|get-file|events>');
+      console.error('usage: ghostbus-cli [--store file] <status|agents|register|send|inbox|task|tasks|claim|approve|complete|comment|board|search|put-file|get-file|events|export|import>');
       process.exit(2);
   }
 } catch (e) { console.error(`Error: ${e.message}`); process.exit(1); }

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.0 — 2026-10-08
+
+The operator release — running a hosted bus day-to-day:
+
+- **Workspace key rotation** (hosted, admin) — `POST /api/workspaces/<id>/rotate-key` returns a fresh key once and invalidates the old key *immediately* (the cached workspace meta is refreshed in-process; no restart, no grace period). `keyRotatedAt` is stamped in the registry.
+- **Workspace export / import** (hosted, admin) — `GET /api/workspaces/<id>/export` returns the full workspace state (agents, messages, tasks, files, capsules, context, provenance log) as one versioned envelope; `POST /api/workspaces/import` recreates it on any host under the same or a new id, always with a **fresh** key. The export can never leak a workspace key: keys exist only as hashes in the registry, which is not part of the state, and agent tokens travel as the hashes already at rest. Existing ids are refused (409); malformed snapshots are refused (400) by the new shared `validateSnapshot`.
+- **Core snapshot/restore** — `bus.snapshot()` (deep-cloned state) and `bus.restore(state)` (shape-validated, workspace identity preserved, restore recorded as a `workspace.restore` provenance event) power the hosted endpoints and the new CLI commands: `ghostbus-cli export <file>` / `ghostbus-cli import <file>` for server-free backup and migration between store files.
+- **Race regression in the main suite** — the v0.4.1 FileStore fix now has a permanent test: 60 concurrent saves across two store instances on one file must all resolve, leave valid JSON, and leave no temp files behind. (The standalone cross-process stress proof remains in the repo history.)
+- 44 checks in the main suite (was 41) + 6 serverless, all passing; both demos green.
+
 ## 0.4.1 — 2026-10-08
 
 Reliability + deploy-assets release:

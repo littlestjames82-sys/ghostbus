@@ -12,8 +12,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 
-export const GHOSTBUS_VERSION = '0.5.0';
+export const GHOSTBUS_VERSION = '0.5.1';
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 export const TASK_STATUSES = ['queued', 'claimed', 'needs-approval', 'done', 'cancelled'];
 const CLAIM_LEASE_MS = 15 * 60 * 1000;
@@ -82,12 +83,44 @@ export class GhostBus {
     // Registration issues the token once; only its sha256 is stored.
     this.requireTokens = !!opts.requireTokens;
     this.listeners = new Set(); // live event subscribers (SSE relay)
+    // Mutation mutex (v0.5.1): a promise chain serializing every public
+    // operation's load -> mutate -> save cycle on THIS instance. Without it,
+    // concurrent calls interleave their cycles against the shared store and
+    // silently lose each other's updates (one op's reload discards another's
+    // not-yet-saved state). The AsyncLocalStorage marker makes the chain
+    // reentrant: public methods that call other public methods (updateCapsule
+    // -> getCapsule, restore -> status, heartbeat -> listAgents) run inline
+    // instead of deadlocking on their own queue.
+    this._chain = Promise.resolve();
+    this._als = new AsyncLocalStorage();
+  }
+
+  /**
+   * Run `fn` inside this bus's serialized section. Callers queue FIFO on the
+   * promise chain; a throwing operation still releases the chain (finally),
+   * so one failure can never wedge the bus. Scope: per Bus instance, in this
+   * process — it cannot span processes sharing one store file (each op there
+   * is still a single atomic read-modify-write) nor serverless invocations.
+   */
+  async _serialized(fn) {
+    if (this._als.getStore() === this) return fn();
+    const prev = this._chain;
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    this._chain = prev.then(() => gate);
+    await prev;
+    try {
+      return await this._als.run(this, fn);
+    } finally {
+      release();
+    }
   }
 
   /** Subscribe to provenance events as they happen. Returns an unsubscribe fn. */
   onEvent(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); }
 
-  async init() {
+  async init() { return this._serialized(() => this._init()); }
+  async _init() {
     // Shared (file) stores are re-read on every call: several processes
     // (stdio servers, the CLI, a relay) can then share ONE workspace file
     // and actually see each other's writes. Each mutation is a fresh
@@ -136,7 +169,8 @@ export class GhostBus {
   }
 
   // ---------- agents ----------
-  async registerAgent({ name, role = '', capabilities = [], token = null }) {
+  async registerAgent(...args) { return this._serialized(() => this._registerAgent(...args)); }
+  async _registerAgent({ name, role = '', capabilities = [], token = null }) {
     await this.init();
     if (!name || typeof name !== 'string') throw new Error('agent name required');
     name = name.trim();
@@ -163,7 +197,8 @@ export class GhostBus {
     return { agent: this._publicAgent(agent), rejoined: false, token: rawToken, tokenNote: 'Store this token — it is shown once and only its hash is kept. Present it as `token` (tools) or x-agent-token (HTTP) when the bus runs with requireTokens.' };
   }
 
-  async rotateAgentToken({ name, token = null }) {
+  async rotateAgentToken(...args) { return this._serialized(() => this._rotateAgentToken(...args)); }
+  async _rotateAgentToken({ name, token = null }) {
     await this.init();
     const a = this._requireAgent(name, token);
     const rawToken = crypto.randomBytes(24).toString('hex');
@@ -173,16 +208,19 @@ export class GhostBus {
     return { agent: this._publicAgent(a), token: rawToken, tokenNote: 'New token — the old one no longer works. Shown once.' };
   }
 
-  async heartbeat({ name, token = null }) {
+  async heartbeat(...args) { return this._serialized(() => this._heartbeat(...args)); }
+  async _heartbeat({ name, token = null }) {
     await this.init();
     const a = this._requireAgent(name, token);
     return { agent: this._publicAgent(a), agents: await this.listAgents() };
   }
 
-  async listAgents() { await this.init(); return this.state.agents.map(a => this._publicAgent(a)); }
+  async listAgents(...args) { return this._serialized(() => this._listAgents(...args)); }
+  async _listAgents() { await this.init(); return this.state.agents.map(a => this._publicAgent(a)); }
 
   // ---------- messages ----------
-  async sendMessage({ from, to = '*', body, channel = 'general', threadId = null, token = null }) {
+  async sendMessage(...args) { return this._serialized(() => this._sendMessage(...args)); }
+  async _sendMessage({ from, to = '*', body, channel = 'general', threadId = null, token = null }) {
     await this.init();
     this._requireAgent(from, token);
     if (to !== '*') this._existsAgent(to);
@@ -201,7 +239,8 @@ export class GhostBus {
   }
 
   /** Messages visible to `agent`: addressed to it, broadcast, or sent by it. Unread-first filtering optional. */
-  async inbox(agentName, { unreadOnly = false, limit = 50, markRead = true, token = null } = {}) {
+  async inbox(...args) { return this._serialized(() => this._inbox(...args)); }
+  async _inbox(agentName, { unreadOnly = false, limit = 50, markRead = true, token = null } = {}) {
     await this.init();
     this._requireAgent(agentName, token);
     let msgs = this.state.messages.filter(m =>
@@ -216,7 +255,8 @@ export class GhostBus {
     return clone(msgs);
   }
 
-  async thread(id) {
+  async thread(...args) { return this._serialized(() => this._thread(...args)); }
+  async _thread(id) {
     await this.init();
     const root = this.state.messages.find(m => m.id === Number(id));
     if (!root) throw new Error(`message not found: ${id}`);
@@ -224,7 +264,8 @@ export class GhostBus {
   }
 
   // ---------- tasks ----------
-  async createTask({ from, title, body = '', assignee = null, priority = 'normal', needsApproval = false, blockedBy = [], token = null }) {
+  async createTask(...args) { return this._serialized(() => this._createTask(...args)); }
+  async _createTask({ from, title, body = '', assignee = null, priority = 'normal', needsApproval = false, blockedBy = [], token = null }) {
     await this.init();
     this._requireAgent(from, token);
     if (assignee) this._existsAgent(assignee);
@@ -257,7 +298,8 @@ export class GhostBus {
     }
   }
 
-  async listTasks({ status = null, assignee = null } = {}) {
+  async listTasks(...args) { return this._serialized(() => this._listTasks(...args)); }
+  async _listTasks({ status = null, assignee = null } = {}) {
     await this.init();
     this._expireClaims(); await this._save();
     let tasks = this.state.tasks;
@@ -266,7 +308,8 @@ export class GhostBus {
     return clone(tasks.sort((a, b) => b.id - a.id));
   }
 
-  async approveTask(id, { by, token = null }) {
+  async approveTask(...args) { return this._serialized(() => this._approveTask(...args)); }
+  async _approveTask(id, { by, token = null }) {
     await this.init();
     this._requireAgent(by, token);
     const task = this._task(id);
@@ -279,7 +322,8 @@ export class GhostBus {
   }
 
   /** Claim is exclusive: a second claim while a lease is live fails loudly. */
-  async claimTask(id, { by, token = null }) {
+  async claimTask(...args) { return this._serialized(() => this._claimTask(...args)); }
+  async _claimTask(id, { by, token = null }) {
     await this.init();
     this._requireAgent(by, token);
     this._expireClaims();
@@ -298,7 +342,8 @@ export class GhostBus {
     return clone(task);
   }
 
-  async completeTask(id, { by, result = '', token = null }) {
+  async completeTask(...args) { return this._serialized(() => this._completeTask(...args)); }
+  async _completeTask(id, { by, result = '', token = null }) {
     await this.init();
     this._requireAgent(by, token);
     const task = this._task(id);
@@ -311,7 +356,8 @@ export class GhostBus {
     return clone(task);
   }
 
-  async cancelTask(id, { by, token = null }) {
+  async cancelTask(...args) { return this._serialized(() => this._cancelTask(...args)); }
+  async _cancelTask(id, { by, token = null }) {
     await this.init();
     this._requireAgent(by, token);
     const task = this._task(id);
@@ -330,7 +376,8 @@ export class GhostBus {
   }
 
   // ---------- shared workspace: files + context + board ----------
-  async putFile({ by, path: p, text, token = null }) {
+  async putFile(...args) { return this._serialized(() => this._putFile(...args)); }
+  async _putFile({ by, path: p, text, token = null }) {
     await this.init();
     this._requireAgent(by, token);
     if (!p || typeof text !== 'string') throw new Error('path and text required');
@@ -343,7 +390,8 @@ export class GhostBus {
     return { path: p, bytes: Buffer.byteLength(text) };
   }
 
-  async getFile(p, { withHistory = false } = {}) {
+  async getFile(...args) { return this._serialized(() => this._getFile(...args)); }
+  async _getFile(p, { withHistory = false } = {}) {
     await this.init();
     const f = this.state.files[p];
     if (!f) throw new Error(`file not found: ${p}`);
@@ -351,19 +399,22 @@ export class GhostBus {
     return { path: p, ...clone(rest), versions: (history || []).length + 1, ...(withHistory ? { history: clone(history || []) } : {}) };
   }
 
-  async fileHistory(p) {
+  async fileHistory(...args) { return this._serialized(() => this._fileHistory(...args)); }
+  async _fileHistory(p) {
     await this.init();
     const f = this.state.files[p];
     if (!f) throw new Error(`file not found: ${p}`);
     return { path: p, current: { text: f.text, updatedBy: f.updatedBy, updatedAt: f.updatedAt }, history: clone(f.history || []) };
   }
 
-  async listFiles() {
+  async listFiles(...args) { return this._serialized(() => this._listFiles(...args)); }
+  async _listFiles() {
     await this.init();
     return Object.entries(this.state.files).map(([p, f]) => ({ path: p, bytes: Buffer.byteLength(f.text), updatedBy: f.updatedBy, updatedAt: f.updatedAt }));
   }
 
-  async putContext({ by, context, token = null }) {
+  async putContext(...args) { return this._serialized(() => this._putContext(...args)); }
+  async _putContext({ by, context, token = null }) {
     await this.init();
     this._requireAgent(by, token);
     if (!context || typeof context !== 'object' || Array.isArray(context)) throw new Error('context must be an object');
@@ -373,13 +424,15 @@ export class GhostBus {
     return { ok: true };
   }
 
-  async getContext() {
+  async getContext(...args) { return this._serialized(() => this._getContext(...args)); }
+  async _getContext() {
     await this.init();
     if (!this.state.context) throw new Error('no context published yet');
     return clone(this.state.context);
   }
 
-  async addTaskComment(id, { by, body, token = null }) {
+  async addTaskComment(...args) { return this._serialized(() => this._addTaskComment(...args)); }
+  async _addTaskComment(id, { by, body, token = null }) {
     await this.init();
     this._requireAgent(by, token);
     if (!body || !String(body).trim()) throw new Error('comment body required');
@@ -394,7 +447,8 @@ export class GhostBus {
     return clone(task);
   }
 
-  async deleteFile({ by, path: p, token = null }) {
+  async deleteFile(...args) { return this._serialized(() => this._deleteFile(...args)); }
+  async _deleteFile({ by, path: p, token = null }) {
     await this.init();
     this._requireAgent(by, token);
     if (!this.state.files[p]) throw new Error(`file not found: ${p}`);
@@ -404,7 +458,8 @@ export class GhostBus {
     return { path: p, deleted: true };
   }
 
-  async listChannels() {
+  async listChannels(...args) { return this._serialized(() => this._listChannels(...args)); }
+  async _listChannels() {
     await this.init();
     const counts = {};
     for (const m of this.state.messages) counts[m.channel] = (counts[m.channel] || 0) + 1;
@@ -412,7 +467,8 @@ export class GhostBus {
   }
 
   /** Full-text search across messages, tasks, and shared files. */
-  async search(query, { limit = 20 } = {}) {
+  async search(...args) { return this._serialized(() => this._search(...args)); }
+  async _search(query, { limit = 20 } = {}) {
     await this.init();
     const q = String(query || '').toLowerCase().trim();
     if (q.length < 2) throw new Error('search query needs at least 2 characters');
@@ -437,7 +493,8 @@ export class GhostBus {
   }
 
   /** Read a project capsule, creating it from the template on first touch when create=true. */
-  async getCapsule(slug, { create = false, title = '', by = null, token = null } = {}) {
+  async getCapsule(...args) { return this._serialized(() => this._getCapsule(...args)); }
+  async _getCapsule(slug, { create = false, title = '', by = null, token = null } = {}) {
     await this.init();
     const pth = this._capsulePath(slug);
     if (!this.state.files[pth]) {
@@ -451,7 +508,8 @@ export class GhostBus {
   }
 
   /** Replace one capsule section (State / Decisions / Next) or append to the Session log. */
-  async updateCapsule(slug, { by, section, text, token = null }) {
+  async updateCapsule(...args) { return this._serialized(() => this._updateCapsule(...args)); }
+  async _updateCapsule(slug, { by, section, text, token = null }) {
     await this.init();
     this._requireAgent(by, token);
     await this.getCapsule(slug, { create: true, by, token });
@@ -477,13 +535,15 @@ export class GhostBus {
     return this.getFile(pth);
   }
 
-  async listCapsules() {
+  async listCapsules(...args) { return this._serialized(() => this._listCapsules(...args)); }
+  async _listCapsules() {
     await this.init();
     return Object.keys(this.state.files).filter(p => p.startsWith('capsules/') && p.endsWith('.md')).map(p => p.slice('capsules/'.length, -3)).sort();
   }
 
   /** A human-readable board rendered from live state — the shared picture at a glance. */
-  async board() {
+  async board(...args) { return this._serialized(() => this._board(...args)); }
+  async _board() {
     await this.init();
     this._expireClaims();
     const s = this.state;
@@ -511,18 +571,21 @@ export class GhostBus {
 
   /** Catch-up sync: every event after `sinceSeq`, plus the current head seq.
    *  An agent that was offline replays exactly what it missed — nothing more. */
-  async sync({ sinceSeq = 0, limit = 500 } = {}) {
+  async sync(...args) { return this._serialized(() => this._sync(...args)); }
+  async _sync({ sinceSeq = 0, limit = 500 } = {}) {
     await this.init();
     const evs = this.state.events.filter(e => e.seq > Number(sinceSeq));
     return { events: clone(evs.slice(0, Math.min(limit, 1000))), headSeq: this.state.seq, truncated: evs.length > Math.min(limit, 1000) };
   }
 
-  async events({ limit = 50 } = {}) {
+  async events(...args) { return this._serialized(() => this._events(...args)); }
+  async _events({ limit = 50 } = {}) {
     await this.init();
     return clone(this.state.events.slice(-Math.min(limit, 500)));
   }
 
-  async status() {
+  async status(...args) { return this._serialized(() => this._status(...args)); }
+  async _status() {
     await this.init();
     this._expireClaims();
     const s = this.state;
@@ -540,7 +603,8 @@ export class GhostBus {
   /** Full-state snapshot for backup / migration. The state holds agent token
    *  HASHES only, never plaintext secrets; workspace keys live outside the
    *  state (hosted registry) and are never part of a snapshot. */
-  async snapshot() {
+  async snapshot(...args) { return this._serialized(() => this._snapshot(...args)); }
+  async _snapshot() {
     await this.init();
     return clone(this.state);
   }
@@ -549,7 +613,8 @@ export class GhostBus {
    *  The snapshot is shape-validated, the workspace identity is preserved
    *  unless the snapshot carries one, and the restore itself is recorded
    *  in the provenance log. Returns the post-restore status. */
-  async restore(snapshot, { by = 'operator' } = {}) {
+  async restore(...args) { return this._serialized(() => this._restore(...args)); }
+  async _restore(snapshot, { by = 'operator' } = {}) {
     await this.init();
     const bad = validateSnapshot(snapshot);
     if (bad) throw Object.assign(new Error(`invalid snapshot: ${bad}`), { code: 'BAD_SNAPSHOT' });

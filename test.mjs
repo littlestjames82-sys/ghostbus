@@ -269,6 +269,71 @@ await check('concurrent FileStore saves never collide (v0.4.1 race regression)',
   assert.equal(fs.readdirSync(tmp).filter(f => f.includes('.tmp.')).length, 0, 'temp files left behind');
 });
 
+await check('concurrent writers on one bus lose no updates (v0.5.1 mutex regression)', async () => {
+  // The operation-level race the per-Bus mutex fixes: every op is a fresh
+  // load -> mutate -> save, so 4 writers x 12 rounds in flight at once on ONE
+  // bus instance used to interleave their cycles and silently drop writes —
+  // the original Ghost Hands probe ended with one writer's file stuck at an
+  // early round and another's missing entirely, zero errors. With the mutex,
+  // every writer's file must end at its final round, on disk too.
+  const file = path.join(tmp, 'mutex.json');
+  const mb = await createBus(new FileStore(file), { name: 'Mutex' });
+  const writers = ['w-a', 'w-b', 'w-c', 'w-d'];
+  for (const w of writers) await mb.registerAgent({ name: w });
+  const ROUNDS = 12;
+  await Promise.all(writers.map(async (w) => {
+    for (let r = 1; r <= ROUNDS; r++) await mb.putFile({ by: w, path: `${w}.txt`, text: `round ${r}` });
+  }));
+  for (const w of writers) {
+    assert.equal((await mb.getFile(`${w}.txt`)).text, `round ${ROUNDS}`, `${w} file is stale`);
+  }
+  const fresh = await createBus(new FileStore(file));
+  assert.equal((await fresh.listFiles()).filter(f => f.path.endsWith('.txt')).length, 4);
+  for (const w of writers) {
+    assert.equal((await fresh.getFile(`${w}.txt`)).text, `round ${ROUNDS}`, `${w} file stale on disk`);
+  }
+});
+
+await check('concurrent mixed ops (tasks + messages + files at once) all land', async () => {
+  const file = path.join(tmp, 'mutex-mixed.json');
+  const mb = await createBus(new FileStore(file), { name: 'Mixed' });
+  await mb.registerAgent({ name: 'mixer' });
+  const N = 10;
+  await Promise.all([
+    ...Array.from({ length: N }, (_, i) => mb.createTask({ from: 'mixer', title: `mix-task-${i}` })),
+    ...Array.from({ length: N }, (_, i) => mb.sendMessage({ from: 'mixer', to: '*', body: `mix-msg-${i}` })),
+    ...Array.from({ length: N }, (_, i) => mb.putFile({ by: 'mixer', path: `mix-${i}.txt`, text: `content ${i}` })),
+  ]);
+  const s = await mb.status();
+  assert.equal(s.tasks.total, N, 'tasks lost under concurrency');
+  assert.equal(s.messages, N, 'messages lost under concurrency');
+  assert.equal(s.files, N, 'files lost under concurrency');
+  const ids = (await mb.listTasks()).map(t => t.id);
+  assert.equal(new Set(ids).size, N, 'task ids duplicated under concurrency');
+});
+
+await check('a throwing operation releases the mutex (bus never wedges)', async () => {
+  const file = path.join(tmp, 'mutex-throw.json');
+  const mb = await createBus(new FileStore(file), { name: 'Throw' });
+  await mb.registerAgent({ name: 'tosser' });
+  const results = await Promise.allSettled([
+    mb.putFile({ by: 'tosser', path: 'ok-1.txt', text: 'one' }),
+    mb.putFile({ by: 'tosser', path: '../evil', text: 'boom' }),   // throws mid-op
+    mb.createTask({ from: 'ghost-agent', title: 'will fail' }),    // unknown agent, throws
+    mb.putFile({ by: 'tosser', path: 'ok-2.txt', text: 'two' }),
+    mb.sendMessage({ from: 'tosser', to: '*', body: 'still alive' }),
+  ]);
+  assert.equal(results.filter(r => r.status === 'rejected').length, 2);
+  assert.equal(results.filter(r => r.status === 'fulfilled').length, 3);
+  // If a throw wedged the chain, every later call would hang — race a timeout.
+  const alive = await Promise.race([
+    mb.status(),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('bus wedged: chain did not release after a throw')), 5000)),
+  ]);
+  assert.equal(alive.messages, 1);
+  assert.equal((await mb.getFile('ok-2.txt')).text, 'two');
+});
+
 await check('snapshot -> restore round-trip preserves the workspace; bad snapshot refused', async () => {
   const src = await createBus(new MemoryStore(), { name: 'Snap Source' });
   await src.registerAgent({ name: 'snapper' });

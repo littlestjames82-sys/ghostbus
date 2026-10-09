@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.1 — 2026-10-09
+
+Reliability fix — the operation-level race above the v0.4.1 FileStore fix:
+
+- **Per-Bus mutation mutex** — every public operation on a `GhostBus` (register/heartbeat, message send, task create/claim/complete/comment, file put/delete, capsule/context writes, token ops, snapshot restore, and reads) now runs its whole load → mutate → save cycle inside a per-instance promise-chain mutex (`_serialized` in src/core.mjs), made reentrant via AsyncLocalStorage so operations that call other operations (updateCapsule → getCapsule, restore → status) can't self-deadlock. Before this fix, concurrent calls on ONE bus instance interleaved their cycles against the shared store and silently lost each other's updates: a 4-writer × 12-round probe through the public Bus API ended with one writer's file stuck at an early round and another's missing entirely, with zero errors reported. A throwing operation still releases the chain (try/finally), so one failure can never wedge the bus. Public API and behavior are unchanged.
+- **Scope boundary, honestly** — the mutex serializes operations within one Bus instance in one process. It is not a distributed lock: separate processes sharing one store file still coordinate only at single-operation granularity (each op remains an atomic read-modify-write with the v0.4.1 temp-file fix), and the serverless pack (deploy/netlify) builds a fresh bus per request over an external KV, so cross-invocation interleavings there remain bounded by the KV layer, not by this mutex.
+- **Regression tests in the main suite** — three new checks: concurrent writers lose no updates (4 writers × 12 rounds, verified on disk via a fresh instance), concurrent mixed ops (tasks + messages + files at once) all land with unique task ids, and a throwing operation releases the mutex (with a wedge timeout). All three fail on the pre-fix core (44 passed, 3 failed) and pass with the fix.
+- 47 checks in the main suite (was 44) + 6 serverless, all passing; both demos green.
+
 ## 0.5.0 — 2026-10-08
 
 The operator release — running a hosted bus day-to-day:

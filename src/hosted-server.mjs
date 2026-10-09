@@ -40,9 +40,15 @@ fs.mkdirSync(dataDir, { recursive: true });
 const registryPath = path.join(dataDir, 'registry.json');
 const loadRegistry = () => { try { return JSON.parse(fs.readFileSync(registryPath, 'utf8')); } catch { return { workspaces: {} }; } };
 const saveRegistry = (reg) => {
-  const tmp = registryPath + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(reg, null, 2));
-  fs.renameSync(tmp, registryPath);
+  // Unique temp per save: two processes sharing this registry must never
+  // collide on one fixed '.tmp' name (first rename wins, second throws ENOENT).
+  const tmp = registryPath + '.tmp.' + process.pid + '.' + Math.random().toString(36).slice(2, 10);
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(reg, null, 2));
+    fs.renameSync(tmp, registryPath);
+  } finally {
+    try { fs.unlinkSync(tmp); } catch { /* already renamed away */ }
+  }
 };
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 const validId = (id) => /^[a-z0-9][a-z0-9-]{1,62}$/.test(String(id || ''));

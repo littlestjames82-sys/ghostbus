@@ -1,6 +1,6 @@
 # GhostBus — Agent-to-Agent Message Bus / Shared Workspace MCP
 
-**Status:** PUBLISHED — v0.3.0 live Oct 7, 2026 (github.com/littlestjames82-sys/ghostbus). v0.3.0 added capsules, task dependencies, sync, shared-store reload (real multi-process sharing), long-poll, file history, wake-hook example, relay hardening — 40/40 tests. npm: name `ghostbus` verified available; publish rides the Trusted-Publishing workflow after Ryan's one-time npm setup (see LAUNCH.md).
+**Status:** PUBLISHED — v0.4.1 live Oct 8, 2026 (github.com/littlestjames82-sys/ghostbus). v0.4.0 added the hosted multi-workspace server + Docker + Netlify serverless pack (41/41 + 6/6 tests). v0.4.1 fixed the FileStore temp-file race (unique temp per save + serialized saves; stress 0 failures vs 59/60 failing before), shipped the docker-compose + one-shot VPS setup assets, and passed a full hosted smoke test. Still not deployed to a public host — that waits on Ryan's VPS choice. npm: name `ghostbus` verified available; publish rides the Trusted-Publishing workflow after Ryan's one-time npm setup (see LAUNCH.md).
 **Origin:** Generalizes Ghost Bridge (Ryan's private Muse ↔ Antigravity relay, Level 3, live since Oct 6) into a standalone product any agents can join. Ghost Bridge stays private; GhostBus is the clean, general version — same proven patterns, no Ryan-specific context, no studio data in the box.
 
 ## The problem (one line)
@@ -31,7 +31,7 @@ A zero-dependency Node server that gives any MCP-capable agent (Claude, Cursor, 
 ## Milestones
 - **M0 (DONE, Oct 7):** core + 19 MCP tools + stdio server + HTTP relay + file/memory stores, 23/23 tests (core, persistence, stdio E2E with two agents, HTTP E2E with auth), two-agent demo, README/PLAN/examples.
 - **M1 (DONE, shipped in v0.2.0):** per-agent tokens with enforced mode + rotation, SSE event push, web board UI, search, task comments, heartbeat/presence, file delete, channels, terminal CLI, client-setup docs, three-agent demo, CI + npm Trusted-Publishing workflow. Still open from the original list: wake hooks as a shipped example (pattern documented in docs/client-setup.md).
-- **M2 (DONE, shipped in v0.4.0):** hosted multi-workspace server (registry, per-workspace keys, isolation, admin API, Docker) + Netlify/Blobs serverless pack with mock-tested logic. NOT yet deployed anywhere public — a live deploy is an ops step (Netlify credits reset Oct 24, or any VPS/Docker host). Remaining from the original list: A2A-protocol bridge adapter, only if demand shows up.
+- **M2 (DONE, shipped in v0.4.0; hardened in v0.4.1):** hosted multi-workspace server (registry, per-workspace keys, isolation, admin API, Docker) + Netlify/Blobs serverless pack with mock-tested logic. v0.4.1: FileStore race fixed, docker-compose + vps-setup.sh shipped, hosted smoke test passed. NOT yet deployed anywhere public — Ryan chose the Docker-on-VPS route Oct 8; a live deploy waits on his VPS pick (no VPS provisioned yet, no paid spend without his go). Remaining from the original list: A2A-protocol bridge adapter, only if demand shows up.
 - **M3 / monetization (draft only):** open-source core stays MIT; paid hosted relay (per-workspace) is the GhostGuard/Seatbelt-shaped play. No pricing set — Ryan's call.
 
 ## Ryan's taps (batched)

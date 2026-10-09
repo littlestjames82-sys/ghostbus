@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.1 — 2026-10-08
+
+Reliability + deploy-assets release:
+
+- **FileStore race fixed** — `FileStore.save()` (src/core.mjs) and `saveRegistry()` (src/hosted-server.mjs) both wrote to one fixed `<file>.tmp` then renamed; concurrent writers collided (first rename wins, the rest failed ENOENT, seen live as HTTP 400s during a Ghost Hands bus demo). Fix: unique temp name per save (pid + random suffix), saves serialized per FileStore instance via a promise chain, temp cleaned up in a finally block. Stress proof: original code failed 59/60 concurrent in-process saves and 39–40/40 in each of two cross-process runs; fixed code: 0 failures in all runs, final file valid JSON.
+- **Docker deploy assets shipped** — `deploy/docker/docker-compose.yml` (hosted server with persistent volume + restart policy, admin key via env) and `deploy/docker/vps-setup.sh` (one-shot Ubuntu setup: installs Docker, clones the repo, generates a root-only admin key, builds + runs, prints the first-workspace command).
+- **Hosted smoke verified** — the exact hosted runtime config (admin key + data dir) exercised end to end: health, workspace creation (one-time key), two agents registering, task create → claim → complete, probe counts, cross-workspace key isolation (401), board 200, state files persisted.
+- Suites: 41/41 main + 6/6 serverless, unchanged and green.
+
 ## 0.4.0 — 2026-10-07
 
 M2 — hosted, multi-workspace:

@@ -1,0 +1,22 @@
+# GhostBus hosted — docker compose route.
+#   GHOSTBUS_ADMIN_KEY=<long secret> docker compose up -d --build
+# Data persists in the ghostbus-data volume (/data in the container).
+services:
+  ghostbus:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: ghostbus-hosted
+    container_name: ghostbus
+    restart: unless-stopped
+    environment:
+      GHOSTBUS_ADMIN_KEY: "${GHOSTBUS_ADMIN_KEY:?set GHOSTBUS_ADMIN_KEY to a long secret}"
+      GHOSTBUS_REQUIRE_TOKENS: "${GHOSTBUS_REQUIRE_TOKENS:-0}"
+      GHOSTBUS_PORT: "8388"
+      GHOSTBUS_DATA_DIR: "/data"
+    ports:
+      - "8388:8388"
+    volumes:
+      - ghostbus-data:/data
+volumes:
+  ghostbus-data:

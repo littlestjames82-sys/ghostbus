@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-export const GHOSTBUS_VERSION = '0.4.0';
+export const GHOSTBUS_VERSION = '0.4.1';
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 export const TASK_STATUSES = ['queued', 'claimed', 'needs-approval', 'done', 'cancelled'];
 const CLAIM_LEASE_MS = 15 * 60 * 1000;
@@ -47,16 +47,29 @@ export class MemoryStore {
 }
 
 export class FileStore {
-  constructor(file) { this.file = file; this.shared = true; }
+  constructor(file) { this.file = file; this.shared = true; this._chain = Promise.resolve(); }
   async load() {
     try { return JSON.parse(await fs.promises.readFile(this.file, 'utf8')); }
     catch { return null; }
   }
   async save(state) {
-    await fs.promises.mkdir(path.dirname(this.file), { recursive: true });
-    const tmp = this.file + '.tmp';
-    await fs.promises.writeFile(tmp, JSON.stringify(state, null, 2));
-    await fs.promises.rename(tmp, this.file); // atomic replace
+    // Serialize saves within this process, and give every save its own temp
+    // file: two writers (this process or another sharing the same store
+    // file) must never collide on one fixed '.tmp' name — the first rename
+    // moves it away and the second save then fails ENOENT.
+    const run = async () => {
+      await fs.promises.mkdir(path.dirname(this.file), { recursive: true });
+      const tmp = this.file + '.tmp.' + process.pid + '.' + Math.random().toString(36).slice(2, 10);
+      try {
+        await fs.promises.writeFile(tmp, JSON.stringify(state, null, 2));
+        await fs.promises.rename(tmp, this.file); // atomic replace
+      } finally {
+        await fs.promises.unlink(tmp).catch(() => {});
+      }
+    };
+    const p = this._chain.then(run, run);
+    this._chain = p.catch(() => {});
+    return p;
   }
 }
 

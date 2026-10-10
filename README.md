@@ -6,10 +6,22 @@ Agents today work alone in separate windows — when two of them need to coopera
 
 Zero dependencies. Node 18+. MIT.
 
+## Install
+
+```bash
+npm install ghostbus
+```
+
+GhostBus is published on npm as [`ghostbus`](https://www.npmjs.com/package/ghostbus) (v0.5.0) — zero dependencies, Node 18+. You can also run it straight from a clone of this repository, as the quick start below shows.
+
+## Status
+
+Built and in use: 29 MCP tools across presence, messages, tasks, a shared workspace, and a provenance log; local stdio servers, an HTTP relay, and a hosted multi-workspace server are all included in this repo, along with a live web board, SSE event pushes, per-agent tokens, and a terminal CLI. See `CHANGELOG.md` for release history and `docs/` for the client setup and hosted-operator guides.
+
 ## Quick start
 
 ```bash
-git clone <this repo> ghostbus && cd ghostbus
+git clone https://github.com/littlestjames82-sys/ghostbus.git ghostbus && cd ghostbus
 node examples/two-agent-demo.mjs   # watch a planner and a builder cooperate
 node test.mjs                      # 47 checks: core, tokens, capsules, dependencies, sync, persistence, concurrency, MCP stdio, HTTP, SSE, CLI
 node examples/three-agent-team.mjs # planner + builder + reviewer, no human relaying
@@ -76,6 +88,19 @@ Same tools over `POST /mcp`, plus a REST mirror under `/api/*`. `/health` and a 
 ## Origin
 
 GhostBus generalizes a private relay that has run in production for one studio's own agents since Oct 2026 (task handoffs, shared project capsules, a live board). This is the clean, general version of that proven pattern. Built by Ghost Developer Studio.
+
+## From Ghost Developer Studio
+
+GhostBus is one part of the studio's agent-infrastructure family:
+
+- **Visual roadmap board** — where every studio product stands, in one picture: [ghost-roadmaps](https://github.com/littlestjames82-sys/ghost-roadmaps)
+- **GhostGuard** — the governance layer for autonomous systems: [ghostguard](https://github.com/littlestjames82-sys/ghostguard)
+- **Ghost Bridge** — MCP bridge + self-hostable relay for handing tasks to a personal agent, with scoped keys and approvals: [ghost-bridge](https://github.com/littlestjames82-sys/ghost-bridge)
+- **Ghost Hands** — governed, recorded, replayable agent hands for the web: [ghost-hands](https://github.com/littlestjames82-sys/ghost-hands)
+- **Agent Seatbelt** — deterministic guardrails that gate what an AI coding agent does before it does it: [agent-seatbelt](https://github.com/littlestjames82-sys/agent-seatbelt)
+- **Ghost Developer Studio storefront** — [storefront](https://github.com/littlestjames82-sys/storefront)
+
+Built in public by Ryan Cotten / Ghost Developer Studio.
 
 ## License
 

@@ -1,0 +1,58 @@
+--- a/src/core.mjs
++++ b/src/core.mjs
+@@ -47,16 +47,29 @@
+ }
+ 
+ export class FileStore {
+-  constructor(file) { this.file = file; this.shared = true; }
++  constructor(file) { this.file = file; this.shared = true; this._chain = Promise.resolve(); }
+   async load() {
+     try { return JSON.parse(await fs.promises.readFile(this.file, 'utf8')); }
+     catch { return null; }
+   }
+   async save(state) {
+-    await fs.promises.mkdir(path.dirname(this.file), { recursive: true });
+-    const tmp = this.file + '.tmp';
+-    await fs.promises.writeFile(tmp, JSON.stringify(state, null, 2));
+-    await fs.promises.rename(tmp, this.file); // atomic replace
++    // Serialize saves within this process, and give every save its own temp
++    // file: two writers (this process or another sharing the same store
++    // file) must never collide on one fixed '.tmp' name — the first rename
++    // moves it away and the second save then fails ENOENT.
++    const run = async () => {
++      await fs.promises.mkdir(path.dirname(this.file), { recursive: true });
++      const tmp = this.file + '.tmp.' + process.pid + '.' + Math.random().toString(36).slice(2, 10);
++      try {
++        await fs.promises.writeFile(tmp, JSON.stringify(state, null, 2));
++        await fs.promises.rename(tmp, this.file); // atomic replace
++      } finally {
++        await fs.promises.unlink(tmp).catch(() => {});
++      }
++    };
++    const p = this._chain.then(run, run);
++    this._chain = p.catch(() => {});
++    return p;
+   }
+ }
+ 
+--- a/src/hosted-server.mjs
++++ b/src/hosted-server.mjs
+@@ -40,9 +40,15 @@
+ const registryPath = path.join(dataDir, 'registry.json');
+ const loadRegistry = () => { try { return JSON.parse(fs.readFileSync(registryPath, 'utf8')); } catch { return { workspaces: {} }; } };
+ const saveRegistry = (reg) => {
+-  const tmp = registryPath + '.tmp';
+-  fs.writeFileSync(tmp, JSON.stringify(reg, null, 2));
+-  fs.renameSync(tmp, registryPath);
++  // Unique temp per save: two processes sharing this registry must never
++  // collide on one fixed '.tmp' name (first rename wins, second throws ENOENT).
++  const tmp = registryPath + '.tmp.' + process.pid + '.' + Math.random().toString(36).slice(2, 10);
++  try {
++    fs.writeFileSync(tmp, JSON.stringify(reg, null, 2));
++    fs.renameSync(tmp, registryPath);
++  } finally {
++    try { fs.unlinkSync(tmp); } catch { /* already renamed away */ }
++  }
+ };
+ const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
+ const validId = (id) => /^[a-z0-9][a-z0-9-]{1,62}$/.test(String(id || ''));

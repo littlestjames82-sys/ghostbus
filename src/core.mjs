@@ -14,7 +14,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 
-export const GHOSTBUS_VERSION = '0.5.4';
+export const GHOSTBUS_VERSION = '0.5.5';
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 // Timing-safe equality for hex digests (v0.5.3): secret comparisons must not
 // short-circuit on the first differing character the way === does.
@@ -36,6 +36,19 @@ const RESERVED_FILE_NAMES = new Set(['__proto__', 'constructor', 'prototype']);
 
 const now = () => new Date().toISOString();
 const clone = (v) => JSON.parse(JSON.stringify(v));
+// Untrusted numeric inputs (HTTP query params, MCP arguments, direct API
+// callers) arrive as NaN, negatives, and absurd magnitudes, and raw
+// slice(-n) arithmetic turns them into nonsense: limit=0 or NaN returned
+// EVERYTHING (slice(-0) / slice(NaN) both mean "from the start"), limit=-1
+// returned all-but-one (v0.5.5). Every list/read path clamps through here:
+// non-finite -> the default, fractional -> floored, out-of-range -> the
+// [0, max] bound; a clamped limit of 0 honestly means "return none".
+const clampLimit = (v, def, max) => {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return def;
+  return Math.max(0, Math.min(Math.floor(n), max));
+};
+const tailSlice = (arr, lim) => (lim > 0 ? arr.slice(-lim) : []);
 
 function emptyState(workspace = {}) {
   return {
@@ -245,9 +258,13 @@ export class GhostBus {
     if (to !== '*') this._existsAgent(to);
     if (!body || !String(body).trim()) throw new Error('message body required');
     this.state.msgSeq += 1;
+    // threadId names a message id; anything that isn't a positive finite
+    // number (an object used to land here as NaN, invisible to thread()
+    // until a reload quietly rewrote it to null) is simply "no thread".
+    const tid = Number(threadId);
     const msg = {
       id: this.state.msgSeq, from, to, channel: String(channel).slice(0, 64),
-      body: String(body), threadId: threadId ? Number(threadId) : null,
+      body: String(body), threadId: Number.isFinite(tid) && tid >= 1 ? Math.floor(tid) : null,
       createdAt: now(), readBy: [from],
     };
     this.state.messages.push(msg);
@@ -265,7 +282,7 @@ export class GhostBus {
     let msgs = this.state.messages.filter(m =>
       m.to === agentName || m.to === '*' || m.from === agentName);
     if (unreadOnly) msgs = msgs.filter(m => !m.readBy.includes(agentName));
-    msgs = msgs.slice(-Math.min(limit, 500));
+    msgs = tailSlice(msgs, clampLimit(limit, 50, 500));
     if (markRead) {
       let changed = false;
       for (const m of msgs) if (!m.readBy.includes(agentName)) { m.readBy.push(agentName); changed = true; }
@@ -399,7 +416,7 @@ export class GhostBus {
   async _putFile({ by, path: p, text, token = null }) {
     await this.init();
     this._requireAgent(by, token);
-    if (!p || typeof text !== 'string') throw new Error('path and text required');
+    if (typeof p !== 'string' || !p || typeof text !== 'string') throw new Error('path and text required');
     if (String(p).includes('..')) throw new Error('path may not contain ..');
     if (RESERVED_FILE_NAMES.has(p)) throw new Error('path is a reserved name');
     const prev = this.state.files[p];
@@ -495,11 +512,12 @@ export class GhostBus {
     const q = String(query || '').toLowerCase().trim();
     if (q.length < 2) throw new Error('search query needs at least 2 characters');
     const hit = (text) => String(text || '').toLowerCase().includes(q);
+    const lim = clampLimit(limit, 20, 500);
     return {
       query,
-      messages: clone(this.state.messages.filter(m => hit(m.body)).slice(-limit)),
-      tasks: clone(this.state.tasks.filter(t => hit(t.title) || hit(t.body) || hit(t.result)).slice(-limit)),
-      files: Object.entries(this.state.files).filter(([p, f]) => hit(p) || hit(f.text)).slice(0, limit)
+      messages: clone(tailSlice(this.state.messages.filter(m => hit(m.body)), lim)),
+      tasks: clone(tailSlice(this.state.tasks.filter(t => hit(t.title) || hit(t.body) || hit(t.result)), lim)),
+      files: Object.entries(this.state.files).filter(([p, f]) => hit(p) || hit(f.text)).slice(0, lim)
         .map(([p, f]) => ({ path: p, updatedBy: f.updatedBy, updatedAt: f.updatedAt, excerpt: f.text.slice(0, 200) })),
     };
   }
@@ -596,14 +614,20 @@ export class GhostBus {
   async sync(...args) { return this._serialized(() => this._sync(...args)); }
   async _sync({ sinceSeq = 0, limit = 500 } = {}) {
     await this.init();
-    const evs = this.state.events.filter(e => e.seq > Number(sinceSeq));
-    return { events: clone(evs.slice(0, Math.min(limit, 1000))), headSeq: this.state.seq, truncated: evs.length > Math.min(limit, 1000) };
+    // A garbage cursor (NaN from a non-numeric query param) used to match
+    // NOTHING and report truncated:false — an offline agent would believe
+    // itself caught up while missing everything (v0.5.5). It now means
+    // what a missing cursor means: replay from the start, limit-bounded.
+    const since = Number.isFinite(Number(sinceSeq)) ? Math.max(0, Math.floor(Number(sinceSeq))) : 0;
+    const lim = clampLimit(limit, 500, 1000);
+    const evs = this.state.events.filter(e => e.seq > since);
+    return { events: clone(evs.slice(0, lim)), headSeq: this.state.seq, truncated: evs.length > lim };
   }
 
   async events(...args) { return this._serialized(() => this._events(...args)); }
   async _events({ limit = 50 } = {}) {
     await this.init();
-    return clone(this.state.events.slice(-Math.min(limit, 500)));
+    return clone(tailSlice(this.state.events, clampLimit(limit, 50, 500)));
   }
 
   async status(...args) { return this._serialized(() => this._status(...args)); }

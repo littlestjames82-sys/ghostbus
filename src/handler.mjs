@@ -139,7 +139,11 @@ export function createBusHandler({ id = 'default', bus, key = '' }) {
       if (req.method === 'GET' && url.pathname === '/api/wait') {
         const agent = url.searchParams.get('agent');
         if (!agent) return send(400, { error: 'agent query param required' });
-        const timeout = Math.min(Number(url.searchParams.get('timeout') || 25), 55) * 1000;
+        // Garbage timeouts (timeout=abc -> NaN -> an instant empty reply;
+        // negative -> the same) fall back to the 25s default; real values
+        // clamp into [0, 55]s (v0.5.5).
+        const tParam = Number(url.searchParams.get('timeout') || 25);
+        const timeout = (Number.isFinite(tParam) ? Math.min(Math.max(tParam, 0), 55) : 25) * 1000;
         const sinceSeq = url.searchParams.has('sinceSeq') ? Number(url.searchParams.get('sinceSeq')) : (await bus.sync({})).headSeq;
         const immediate = await bus.sync({ sinceSeq, limit: 100 });
         const relevantNow = immediate.events.filter(ev => ev.type !== 'message.send' || ev.to === agent || ev.to === '*' || ev.actor === agent);

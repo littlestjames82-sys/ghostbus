@@ -917,6 +917,235 @@ await check('hosted hostile input (v0.5.4): a planted registry entry cannot esca
   } finally { proc.kill(); }
 });
 
+/* ---------------- fuzz + edge parameters (v0.5.5) ---------------- */
+console.log('fuzz + edge parameters (v0.5.5):');
+await check('tools validation (v0.5.5): wrong-typed MCP args are clean errors; nothing coerced lands in state', async () => {
+  const fb = await createBus(new MemoryStore(), { name: 'Fuzz WS' });
+  await callTool(fb, 'bus_register', { agent: 'fz-a' });
+  await callTool(fb, 'bus_register', { agent: 'fz-b' });
+  // every one of these used to be silently coerced by the core (an object
+  // body was STORED as the message "[object Object]"; a numeric path became
+  // a state key) or died as a bare TypeError — now the tools boundary
+  // rejects them against the declared schema, before the bus is touched.
+  await assert.rejects(() => callTool(fb, 'bus_send', { agent: 'fz-a', to: 'fz-b', body: { text: 'hi' } }), /argument "body" must be a string/);
+  await assert.rejects(() => callTool(fb, 'bus_send', { agent: 'fz-a', to: 'fz-b', body: ['x'] }), /argument "body" must be a string/);
+  await assert.rejects(() => callTool(fb, 'bus_thread', { id: 'abc' }), /argument "id" must be a finite number/);
+  await assert.rejects(() => callTool(fb, 'bus_send', { agent: 'fz-a', body: 'x', threadId: {} }), /argument "threadId" must be a finite number/);
+  await assert.rejects(() => callTool(fb, 'bus_register', { agent: 'fz-c', capabilities: 'all' }), /argument "capabilities" must be an array/);
+  await assert.rejects(() => callTool(fb, 'bus_create_task', { agent: 'fz-a', title: 't', blockedBy: 'nope' }), /argument "blockedBy" must be an array/);
+  await assert.rejects(() => callTool(fb, 'workspace_put_file', { agent: 'fz-a', path: 'n.txt', text: 42 }), /argument "text" must be a string/);
+  await assert.rejects(() => callTool(fb, 'workspace_put_file', { agent: 'fz-a', path: 42, text: 'x' }), /argument "path" must be a string/);
+  await assert.rejects(() => callTool(fb, 'workspace_put_context', { agent: 'fz-a', context: 'ctx' }), /argument "context" must be an object/);
+  await assert.rejects(() => callTool(fb, 'workspace_get_capsule', { slug: null, create: true, agent: 'fz-a' }), /missing required argument "slug"/);
+  await assert.rejects(() => callTool(fb, 'bus_send', { agent: 'fz-a' }), /missing required argument "body"/);
+  await assert.rejects(() => callTool(fb, 'bus_send', null), /arguments must be an object/);
+  await assert.rejects(() => callTool(fb, 'bus_inbox', { agent: 'fz-a', limit: NaN }), /argument "limit" must be a finite number/);
+  await assert.rejects(() => callTool(fb, 'bus_inbox', { agent: 'fz-a', limit: Infinity }), /argument "limit" must be a finite number/);
+  // __proto__ keys inside argument objects ride through as inert data
+  // (JSON-shaped clones everywhere); the prototype is never touched.
+  await callTool(fb, 'bus_send', JSON.parse('{"agent":"fz-a","to":"fz-b","body":"proto call","__proto__":{"polluted":"yes"}}'));
+  await callTool(fb, 'workspace_put_context', { agent: 'fz-a', context: JSON.parse('{"__proto__":{"polluted":"yes"},"a":1}') });
+  assert.equal({}.polluted, undefined);
+  // core numeric hygiene, exercised directly (HTTP passes raw Numbers in):
+  // limit=0 / -1 used to return EVERYTHING / all-but-one via slice(-n).
+  await fb.sendMessage({ from: 'fz-a', to: 'fz-b', body: 'n1' });
+  await fb.sendMessage({ from: 'fz-a', to: 'fz-b', body: 'n2' });
+  assert.equal((await fb.inbox('fz-b', { limit: 0, markRead: false })).length, 0);
+  assert.equal((await fb.inbox('fz-b', { limit: -1, markRead: false })).length, 0);
+  assert.equal((await fb.inbox('fz-b', { limit: NaN, markRead: false })).length, 3); // non-finite -> default
+  assert.equal((await fb.events({ limit: -1 })).length, 0);
+  const syncBad = await fb.sync({ sinceSeq: 'abc', limit: 2 }); // garbage cursor replays from the start, bounded
+  assert.equal(syncBad.events.length, 2); assert.equal(syncBad.truncated, true);
+  const nanThread = await fb.sendMessage({ from: 'fz-a', to: 'fz-b', body: 'tid', threadId: {} });
+  assert.equal(nanThread.threadId, null); // never NaN in state
+  // nothing the validation rejected leaked into shared state
+  const st = await fb.status();
+  assert.equal(st.messages, 4); // proto call + n1 + n2 + tid — the rejects stored nothing
+  assert.equal(st.tasks.total, 0); assert.equal(st.files, 0);
+  const bodies = (await fb.inbox('fz-b', { markRead: false, limit: 50 })).map(m => m.body);
+  assert.ok(!bodies.includes('[object Object]'), 'coerced garbage body in state');
+});
+
+await check('mcp stdio fuzz (v0.5.5): hostile frames + per-tool arg fuzz never crash the server; bus stays intact', async () => {
+  const storeFile = path.join(tmp, 'fuzz.json');
+  const proc = spawn('node', ['src/mcp-server.mjs', '--store', storeFile], { cwd: new URL('.', import.meta.url).pathname, stdio: ['pipe', 'pipe', 'pipe'] });
+  let buf = ''; const pending = new Map(); let seq = 0;
+  proc.stdout.on('data', d => {
+    buf += d;
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, i); buf = buf.slice(i + 1);
+      if (!line.trim()) continue;
+      const m = JSON.parse(line);
+      if (m.id !== undefined && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); }
+    }
+  });
+  const rpc = (method, params) => new Promise((res, rej) => {
+    const id = ++seq;
+    const t = setTimeout(() => { pending.delete(id); rej(new Error(`stdio server did not answer ${method} (wedged or dead)`)); }, 4000);
+    pending.set(id, (m) => { clearTimeout(t); res(m); });
+    proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+  });
+  try {
+    await rpc('initialize', {});
+    const call = (name, args) => rpc('tools/call', { name, arguments: args });
+    assert.ok(!(await call('bus_register', { agent: 'fuzz-a' })).result.isError);
+    assert.ok(!(await call('bus_register', { agent: 'fuzz-b' })).result.isError);
+    // hostile raw frames: on v0.5.4 the first of these (`null`) crashed the
+    // process outright — an unhandled TypeError in handle().
+    for (const line of ['null', '"just a string"', '123', 'true', '[1,2,3]', '{broken json', '{"jsonrpc":"2.0","id":990,"method":"tools/call"}', '{"jsonrpc":"2.0","id":991,"method":"tools/call","params":null}']) {
+      proc.stdin.write(line + '\n');
+      await new Promise(r => setTimeout(r, 75));
+      assert.equal(proc.exitCode, null, `server died on frame: ${line.slice(0, 40)}`);
+    }
+    await rpc('ping', {}); // still answering
+    // per-tool battery: every declared property, one at a time, set to a
+    // wrong-typed value. Each must come back as a clean isError result —
+    // never a hang, never a crash, never a coerced store.
+    const WRONG = { string: { bad: 'obj' }, number: 'not-a-number', boolean: 'not-a-bool', array: 'not-an-array', object: [1, 2, 3] };
+    const FILL = { string: 'x', number: 1, boolean: true, array: [], object: {} };
+    let variants = 0;
+    for (const tool of TOOLS) {
+      const props = Object.entries(tool.inputSchema.properties || {});
+      if (!props.length) { const r = await call(tool.name, {}); assert.ok(r.result && Array.isArray(r.result.content), tool.name); continue; }
+      for (const [k, spec] of props) {
+        const args = {};
+        for (const [pk, ps] of props) args[pk] = pk === 'agent' ? 'fuzz-a' : FILL[ps.type];
+        args[k] = WRONG[spec.type];
+        const r = await call(tool.name, args);
+        assert.ok(r.result && Array.isArray(r.result.content), `${tool.name} (${k}) gave a malformed result`);
+        assert.equal(r.result.isError, true, `${tool.name} accepted ${k}=${JSON.stringify(WRONG[spec.type])}`);
+        variants++;
+      }
+    }
+    assert.equal(variants, 65); // every declared property of all 29 tools, one wrong-typed variant each
+    // a 100KB string body and a 300-deep nested context are legitimate
+    // shapes — both must be handled without drama.
+    assert.ok(!(await call('bus_send', { agent: 'fuzz-a', to: 'fuzz-b', body: 'y'.repeat(100_000) })).result.isError);
+    let nest = { leaf: 1 }; for (let i = 0; i < 300; i++) nest = { n: nest };
+    const deep = await call('workspace_put_context', { agent: 'fuzz-a', context: nest });
+    assert.ok(deep.result && Array.isArray(deep.result.content));
+    // the bus is intact afterwards: same two agents, a normal round-trip
+    // works, and no coerced garbage was stored by the battery.
+    assert.equal(proc.exitCode, null);
+    await call('bus_send', { agent: 'fuzz-a', to: 'fuzz-b', body: 'integrity-marker-55' });
+    const found = await call('bus_search', { query: 'integrity-marker-55' });
+    assert.match(found.result.content[0].text, /integrity-marker-55/);
+    const inbox = await call('bus_inbox', { agent: 'fuzz-b', limit: 500, markRead: false });
+    assert.ok(!inbox.result.content[0].text.includes('[object Object]'), 'coerced garbage reached the inbox');
+    const status = await call('bus_status', {});
+    assert.match(status.result.content[0].text, /"agents": 2/);
+  } finally { proc.kill(); }
+});
+
+await check('board data path (v0.5.5): hostile content stays inert data end-to-end; key never travels in a URL; probe/health leak counts only', async () => {
+  const storeFile = path.join(tmp, 'board.json');
+  const proc = spawn('node', ['src/http-server.mjs', '--port', '18399', '--store', storeFile], { cwd: new URL('.', import.meta.url).pathname, stdio: ['ignore', 'pipe', 'pipe'] });
+  const H = { 'content-type': 'application/json' };
+  const B = 'http://127.0.0.1:18399';
+  try {
+    for (let i = 0; i < 50; i++) { try { const r = await fetch(B + '/health'); if (r.ok) break; } catch {} await new Promise(r => setTimeout(r, 100)); }
+    // seed hostile content through the real API (agent NAMES are regex-
+    // restricted by design; roles, bodies, titles, paths are free text).
+    await fetch(B + '/api/agents', { method: 'POST', headers: H, body: JSON.stringify({ agent: 'board-a', role: '<script>alert(1)</script> & "quoted"' }) });
+    await fetch(B + '/api/agents', { method: 'POST', headers: H, body: JSON.stringify({ agent: 'board-b' }) });
+    await fetch(B + '/api/messages', { method: 'POST', headers: H, body: JSON.stringify({ agent: 'board-a', to: '*', body: '<img src=x onerror=alert(2)> ${7*7} pay\u202eload' }) });
+    await fetch(B + '/api/tasks', { method: 'POST', headers: H, body: JSON.stringify({ agent: 'board-a', title: '"><svg onload=alert(3)>' }) });
+    await fetch(B + '/api/files', { method: 'PUT', headers: H, body: JSON.stringify({ agent: 'board-a', path: 'notes/<b>bold</b>.md', text: '<script>alert(4)</script>' }) });
+    // every data path answers JSON (inert by content type) and carries the
+    // hostile strings VERBATIM — data is neither executed nor mangled.
+    const payloads = {};
+    for (const p of ['/api/agents', '/api/tasks', '/api/events?limit=50', '/api/files/list', '/api/search?q=alert', '/api/board']) {
+      const r = await fetch(B + p);
+      assert.match(r.headers.get('content-type') || '', /application\/json/, p);
+      const txt = await r.text();
+      JSON.parse(txt); // must be valid JSON, not markup
+      payloads[p] = txt;
+    }
+    assert.ok(payloads['/api/agents'].includes('<script>alert(1)</script>'));
+    assert.ok(payloads['/api/tasks'].includes('"><svg onload=alert(3)>'));
+    assert.ok(payloads['/api/files/list'].includes('notes/<b>bold</b>.md'));
+    assert.ok(payloads['/api/search?q=alert'].includes('onerror=alert(2)'));
+    assert.ok(payloads['/api/search?q=alert'].includes('\u202e')); // bidi control round-trips as data
+    assert.ok(payloads['/api/events?limit=50'].includes('<svg onload=alert(3)>')); // via task.create summary
+    // the board page itself: every user field is routed through esc(), the
+    // key lives in localStorage and travels as a header — never in a URL.
+    const html = await (await fetch(B + '/')).text();
+    for (const pat of ['esc(a.name)', 'esc(t.title)', 'esc(e.summary)', 'esc(f.path)', 'localStorage', "'x-bus-key'"]) assert.ok(html.includes(pat), `board.html missing: ${pat}`);
+    assert.ok(!/\?key=|&key=/.test(html), 'board must never put the key in a URL');
+    assert.ok(!html.includes('EventSource'), 'board must not use EventSource (it cannot carry the key header)');
+    // the open surfaces leak exactly their documented shapes — counts only.
+    const probe = await (await fetch(B + '/probe')).json();
+    assert.deepEqual(Object.keys(probe).sort(), ['agents', 'needsApproval', 'queued', 'version', 'workspace']);
+    const health = await (await fetch(B + '/health')).json();
+    assert.deepEqual(Object.keys(health).sort(), ['ok', 'server', 'version', 'workspace']);
+  } finally { proc.kill(); }
+});
+
+await check('http params (v0.5.5): garbage numbers clamp; method/route/traversal edges are clean 4xx — never a 500', async () => {
+  const storeFile = path.join(tmp, 'params.json');
+  const proc = spawn('node', ['src/http-server.mjs', '--port', '18401', '--store', storeFile], { cwd: new URL('.', import.meta.url).pathname, stdio: ['ignore', 'pipe', 'pipe'] });
+  const H = { 'content-type': 'application/json' };
+  const B = 'http://127.0.0.1:18401';
+  try {
+    for (let i = 0; i < 50; i++) { try { const r = await fetch(B + '/health'); if (r.ok) break; } catch {} await new Promise(r => setTimeout(r, 100)); }
+    await fetch(B + '/api/agents', { method: 'POST', headers: H, body: JSON.stringify({ agent: 'pp-a' }) });
+    await fetch(B + '/api/agents', { method: 'POST', headers: H, body: JSON.stringify({ agent: 'pp-b' }) });
+    for (const body of ['m1', 'm2', 'm3']) await fetch(B + '/api/messages', { method: 'POST', headers: H, body: JSON.stringify({ agent: 'pp-a', to: 'pp-b', body }) });
+    const inboxLen = async (qs) => (await (await fetch(`${B}/api/inbox?agent=pp-b&${qs}`)).json()).messages.length;
+    assert.equal(await inboxLen('limit=-1'), 0);   // was: all-but-one
+    assert.equal(await inboxLen('limit=0'), 0);    // was: everything
+    assert.equal(await inboxLen('limit=abc'), 3);  // garbage -> the default page
+    assert.equal(await inboxLen('limit=1e9'), 3);  // absurd -> capped, all 3 fit
+    assert.equal((await (await fetch(B + '/api/events?limit=-1')).json()).events.length, 0);
+    const sync = await (await fetch(B + '/api/sync?sinceSeq=abc&limit=2')).json();
+    assert.equal(sync.events.length, 2); assert.equal(sync.truncated, true); // garbage cursor: replay from start, bounded
+    assert.equal((await fetch(B + '/api/sync?sinceSeq=-9')).status, 200);
+    // method mismatches, trailing slashes, unknown routes: uniform 404
+    assert.equal((await fetch(B + '/api/status', { method: 'POST', headers: H, body: '{}' })).status, 404);
+    assert.equal((await fetch(B + '/api/tasks/1/claim')).status, 404);
+    assert.equal((await fetch(B + '/api/status/')).status, 404);
+    assert.equal((await fetch(B + '/api/nope')).status, 404);
+    assert.equal((await fetch(B + '/api/files?path=' + encodeURIComponent('../secret'))).status, 400); // inert key miss, not a traversal
+  } finally { proc.kill(); }
+  // hosted: encoded traversal in the workspace segment never resolves
+  const dataDir = path.join(tmp, 'params-hosted');
+  const env = { ...process.env, GHOSTBUS_ADMIN_KEY: 'params-admin-secret' };
+  const hproc = spawn('node', ['src/hosted-server.mjs', '--port', '18402', '--data-dir', dataDir], { cwd: new URL('.', import.meta.url).pathname, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const A = { 'content-type': 'application/json', 'x-bus-key': 'params-admin-secret' };
+  try {
+    for (let i = 0; i < 50; i++) { try { const r = await fetch('http://127.0.0.1:18402/health'); if (r.ok) break; } catch {} await new Promise(r => setTimeout(r, 100)); }
+    const created = await (await fetch('http://127.0.0.1:18402/api/workspaces', { method: 'POST', headers: A, body: JSON.stringify({ id: 'edge2', name: 'Edge2' }) })).json();
+    const WK = { 'content-type': 'application/json', 'x-bus-key': created.key };
+    assert.equal((await fetch('http://127.0.0.1:18402/w/%2e%2e%2fregistry/health')).status, 404);
+    assert.equal((await fetch('http://127.0.0.1:18402/w/..%2f..%2fetc/health')).status, 404);
+    assert.equal((await fetch('http://127.0.0.1:18402/w/edge2/api/status/', { headers: WK })).status, 404);
+    assert.equal((await fetch('http://127.0.0.1:18402/w/edge2/api/status', { method: 'POST', headers: WK, body: '{}' })).status, 404);
+    assert.equal((await fetch('http://127.0.0.1:18402/w/edge2/api/inbox?agent=ghost&limit=-1', { headers: WK })).status, 400); // clean 4xx, never 500
+  } finally { hproc.kill(); }
+});
+
+await check('cli (v0.5.5): bad invocations exit non-zero with one-line errors, no stack dumps', async () => {
+  const { execFile } = await import('node:child_process');
+  const cwd = new URL('.', import.meta.url).pathname;
+  const run = (args) => new Promise((res) => {
+    execFile('node', ['src/cli.mjs', ...args], { cwd }, (err, stdout, stderr) => {
+      res({ code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stdout, stderr });
+    });
+  });
+  const storeFile = path.join(tmp, 'cli-bad.json');
+  const noArgs = await run(['--store', storeFile]);
+  assert.equal(noArgs.code, 2); assert.match(noArgs.stderr, /usage:/);
+  const bogus = await run(['--store', storeFile, 'bogus-command']);
+  assert.equal(bogus.code, 2); assert.match(bogus.stderr, /usage:/);
+  const noName = await run(['--store', storeFile, 'register']);
+  assert.equal(noName.code, 1); assert.match(noName.stderr, /^Error: agent name required/);
+  assert.ok(!noName.stderr.includes('\n    at '), 'stack frames leaked to the user');
+  const badClaim = await run(['--store', storeFile, 'claim', 'abc', 'bob']);
+  assert.equal(badClaim.code, 1); assert.match(badClaim.stderr, /^Error: /);
+  assert.ok(!badClaim.stderr.includes('\n    at '), 'stack frames leaked to the user');
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 fs.rmSync(tmp, { recursive: true, force: true });
 process.exit(fail ? 1 : 0);

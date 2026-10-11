@@ -56,6 +56,12 @@ rl.on('line', async (line) => {
   if (!line.trim()) return;
   let msg;
   try { msg = JSON.parse(line); } catch { return; }
-  await handle(msg);
+  // A JSON-RPC message is a plain object. Anything else on the wire — null,
+  // a bare string/number, an array — is ignored, never fatal (v0.5.5: one
+  // bare `null` line used to throw in handle() and kill the server process
+  // for every connected agent). And handle() itself is wrapped: one bad
+  // message must never take the bus down.
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return;
+  try { await handle(msg); } catch { /* a malformed message is dropped, not fatal */ }
 });
 process.stderr.write(`ghostbus mcp-server v${GHOSTBUS_VERSION} · store=${storePath} · workspace="${wsName}"\n`);

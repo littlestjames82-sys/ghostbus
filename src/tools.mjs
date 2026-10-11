@@ -35,7 +35,45 @@ export const TOOLS = [
   { name: 'bus_events', description: 'Read the provenance event log (who did what, when).', inputSchema: { type: 'object', properties: { limit: { type: 'number', default: 50 } } } },
 ];
 
+// Argument validation (v0.5.5): an MCP client — or a prompt-injected agent
+// driving one — can send ANY argument shapes, and the core bus deliberately
+// coerces a lot (String(body) turned an object body into a stored
+// "[object Object]" message; a numeric `path` became a state key). The
+// tools layer is the trust boundary, so arguments are checked against the
+// tool's own declared inputSchema here, once, instead of per-tool ad-hoc
+// checks: required arguments must be present (null counts as missing, the
+// codebase's absent-value convention), and every provided argument must
+// match its declared type — numbers must be finite, objects must be plain
+// objects (not arrays/null). Undeclared extra arguments pass through
+// untouched (several tools read an undeclared `token`). Violations throw a
+// plain Error, which both transports already surface as a clean isError /
+// 400 result — never a crash, never coerced garbage in shared state.
+const ARG_TYPE_CHECKS = {
+  string: { ok: (v) => typeof v === 'string', label: 'a string' },
+  number: { ok: (v) => typeof v === 'number' && Number.isFinite(v), label: 'a finite number' },
+  boolean: { ok: (v) => typeof v === 'boolean', label: 'a boolean' },
+  array: { ok: (v) => Array.isArray(v), label: 'an array' },
+  object: { ok: (v) => !!v && typeof v === 'object' && !Array.isArray(v), label: 'an object' },
+};
+function validateToolArgs(tool, args) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) {
+    throw new Error(`tool ${tool.name}: arguments must be an object`);
+  }
+  const schema = tool.inputSchema || {};
+  for (const k of schema.required || []) {
+    if (args[k] === undefined || args[k] === null) throw new Error(`tool ${tool.name}: missing required argument "${k}"`);
+  }
+  for (const [k, spec] of Object.entries(schema.properties || {})) {
+    const v = args[k];
+    if (v === undefined || v === null) continue; // absent optional — the ?? defaults below apply
+    const check = ARG_TYPE_CHECKS[spec.type];
+    if (check && !check.ok(v)) throw new Error(`tool ${tool.name}: argument "${k}" must be ${check.label}`);
+  }
+}
+
 export async function callTool(bus, name, args = {}) {
+  const tool = TOOLS.find(t => t.name === name);
+  if (tool) validateToolArgs(tool, args);
   switch (name) {
     case 'bus_status': return bus.status();
     case 'bus_register': return bus.registerAgent({ name: args.agent, role: args.role, capabilities: args.capabilities, token: args.token ?? null });

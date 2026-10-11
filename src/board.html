@@ -64,7 +64,7 @@ async function refresh(){
       `<div class="agent"><strong>${esc(a.name)}</strong><span class="pill ${a.online?'green':''}">${a.online?'online':'away'}</span><br><span class="muted">${esc(a.role||'agent')}${a.capabilities?.length ? ' · ' + esc(a.capabilities.join(', ')) : ''} · last seen ${esc(a.lastSeenAt)}</span></div>`).join('') : '<span class="muted">none registered</span>';
     const open = tasks.tasks.filter(t => !['done','cancelled'].includes(t.status));
     $('tasks').innerHTML = open.length ? open.map(t =>
-      `<div class="task">#${t.id} <strong>${esc(t.title)}</strong><span class="pill ${t.status==='needs-approval'?'amber':''}">${esc(t.status)}</span><br><span class="muted">from ${esc(t.from)}${t.claimedBy ? ' · claimed by ' + esc(t.claimedBy) : ''}${t.assignee ? ' · for ' + esc(t.assignee) : ''}</span></div>`).join('') : '<span class="muted">queue is empty</span>';
+      `<div class="task">#${esc(t.id)} <strong>${esc(t.title)}</strong><span class="pill ${t.status==='needs-approval'?'amber':''}">${esc(t.status)}</span><br><span class="muted">from ${esc(t.from)}${t.claimedBy ? ' · claimed by ' + esc(t.claimedBy) : ''}${t.assignee ? ' · for ' + esc(t.assignee) : ''}</span></div>`).join('') : '<span class="muted">queue is empty</span>';
     $('files').innerHTML = files.files.length ? files.files.map(f =>
       `<div class="file">📄 ${esc(f.path)}<br><span class="muted">${f.bytes} bytes · ${esc(f.updatedBy)} · ${esc(f.updatedAt)}</span></div>`).join('') : '<span class="muted">no shared files</span>';
     $('events').innerHTML = events.events.slice().reverse().map(e =>

@@ -165,6 +165,30 @@ validation:
   codebase, and the suite carries canary checks that try anyway through
   the context writer and restore payloads.
 
+Round 4 (v0.5.5) treated the clients themselves as untrusted input —
+including MCP clients and any agent driving one:
+
+- **MCP clients are untrusted input — say it plainly.** A client (or a
+  prompt-injected agent behind one) can send any argument shapes it wants.
+  Tool arguments are validated against each tool's declared schema at the
+  tools boundary: wrong-typed or non-finite values are rejected with a
+  clean error result, never coerced into shared state, and a malformed
+  JSON-RPC frame can no longer kill the stdio server process — bad frames
+  are dropped, the bus keeps serving every other agent.
+- **Numeric parameters are clamped everywhere.** Query and argument
+  numbers (`limit`, `sinceSeq`, timeouts) that arrive as garbage,
+  negatives, or absurd magnitudes fall back to defaults and documented
+  caps instead of slice-arithmetic surprises (a `limit` of 0 or -1 used
+  to return *more* data, and a garbage sync cursor falsely reported an
+  agent as caught up).
+- **The board's data path is pinned end-to-end.** Hostile roles, message
+  bodies, task titles, and file names are served verbatim as JSON data
+  (inert by content type), the page routes every interpolated field
+  through its HTML escaper, and the workspace key lives in local storage
+  and travels as a header — never in a URL, where it would land in logs
+  and referers. `/health` and `/probe` return exactly their documented
+  counts-only shapes.
+
 ## Option B — serverless on Netlify (Blobs)
 
 `deploy/netlify/` contains a Netlify Function implementing the same multi-workspace semantics over Netlify Blobs (strong consistency):

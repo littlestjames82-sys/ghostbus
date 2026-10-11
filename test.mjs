@@ -1421,6 +1421,21 @@ await check('hosted tokens (v0.5.7): REST rotation is immediate; delivered crede
   } finally { proc.kill(); }
 });
 
+/* ---------------- supply chain ---------------- */
+console.log('supply chain:');
+await check('pack manifest matches the allowlist (v0.5.8)', async () => {
+  // What npm publish ships is pinned by scripts/check-pack.mjs: an
+  // allowlist over `npm pack --dry-run --json`, required runtime files
+  // present, and tests / deploy kits / dev scripts / runtime state
+  // forbidden. Exit 2 = npm CLI unavailable here — nothing verified,
+  // which is a skip in this suite (the publish workflow runs the same
+  // script as a hard gate, where npm always exists).
+  const { spawnSync } = await import('node:child_process');
+  const r = spawnSync('node', ['scripts/check-pack.mjs'], { encoding: 'utf8' });
+  if (r.status === 2) { console.log('    (skipped: npm CLI unavailable)'); return; }
+  assert.equal(r.status, 0, `check-pack failed:\n${r.stdout}\n${r.stderr}`);
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 fs.rmSync(tmp, { recursive: true, force: true });
 process.exit(fail ? 1 : 0);

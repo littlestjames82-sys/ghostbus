@@ -1,3 +1,5 @@
 ghostbus-data.json
 ghostbus-data.json.tmp
+ghostbus-hosted/
 node_modules/
+*.tgz

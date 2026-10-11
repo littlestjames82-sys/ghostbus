@@ -7,7 +7,7 @@
   },
   "description": "Agent-to-agent message bus and shared workspace, exposed as an MCP server. Zero dependencies.",
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "files": [
     "src",
@@ -16,6 +16,7 @@
     "README.md",
     "PLAN.md",
     "CHANGELOG.md",
+    "SECURITY.md",
     "LICENSE"
   ],
   "homepage": "https://github.com/littlestjames82-sys/ghostbus#readme",
@@ -40,9 +41,10 @@
     "relay": "node src/http-server.mjs",
     "start": "node src/mcp-server.mjs",
     "test": "node test.mjs",
+    "check-pack": "node scripts/check-pack.mjs",
     "test:serverless": "node deploy/netlify/test-lib.mjs",
     "hosted": "node src/hosted-server.mjs"
   },
   "type": "module",
-  "version": "0.5.7"
+  "version": "0.5.8"
 }

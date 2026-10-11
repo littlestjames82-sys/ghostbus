@@ -24,15 +24,24 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # Third-party actions are pinned to full commit SHAs (v0.5.8) — a
+      # retagged or compromised tag cannot change what runs here. The
+      # trailing comment is the release the SHA was resolved from; bump
+      # both together.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      # npm@latest is deliberate, not lazy: npm Trusted Publishing (OIDC)
+      # requires npm >= 11.5.1, newer than the npm bundled with the
+      # runner's Node. Pinning an older npm would break the publish.
       - run: npm install -g npm@latest
       - run: node test.mjs
       - name: Pack (always — this is the verification)
         run: npm pack --dry-run
+      - name: Pack manifest allowlist (nothing unexpected ever ships)
+        run: node scripts/check-pack.mjs
       - name: Publish (release events, or manual with dry=false)
         if: github.event_name == 'release' || inputs.dry == false
         run: npm publish --provenance --access public

@@ -4,7 +4,7 @@
 
 Agents today work alone in separate windows — when two of them need to cooperate, a human copy-pastes between them. GhostBus is the room they meet in instead: any MCP-capable agent (Claude, Cursor, Antigravity, Windsurf, or your own) joins one shared workspace where agents can find each other, message each other, hand off tasks, and share files and context — with a human approval gate and a full provenance log built in.
 
-Zero dependencies. Node 18+. MIT.
+Zero dependencies. Node 20+. MIT.
 
 ## Install
 
@@ -12,7 +12,7 @@ Zero dependencies. Node 18+. MIT.
 npm install ghostbus
 ```
 
-GhostBus is published on npm as [`ghostbus`](https://www.npmjs.com/package/ghostbus) (v0.5.0) — zero dependencies, Node 18+. You can also run it straight from a clone of this repository, as the quick start below shows.
+GhostBus is published on npm as [`ghostbus`](https://www.npmjs.com/package/ghostbus) (v0.5.0) — zero dependencies, Node 20+. You can also run it straight from a clone of this repository, as the quick start below shows.
 
 ## Status
 
@@ -23,7 +23,7 @@ Built and in use: 29 MCP tools across presence, messages, tasks, a shared worksp
 ```bash
 git clone https://github.com/littlestjames82-sys/ghostbus.git ghostbus && cd ghostbus
 node examples/two-agent-demo.mjs   # watch a planner and a builder cooperate
-node test.mjs                      # 70 checks: core, tokens, capsules, dependencies, sync, persistence, concurrency, MCP stdio, HTTP, SSE, CLI, hosted security, hostile input, input fuzz, load & resilience, token lifecycle
+node test.mjs                      # 71 checks: core, tokens, capsules, dependencies, sync, persistence, concurrency, MCP stdio, HTTP, SSE, CLI, hosted security, hostile input, input fuzz, load & resilience, token lifecycle, pack manifest
 node examples/three-agent-team.mjs # planner + builder + reviewer, no human relaying
 ```
 

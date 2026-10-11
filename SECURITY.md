@@ -86,6 +86,38 @@ are the counts-only `/probe`, or a periodic export they can read
 offline. A scoped/read-only credential is a known future feature, not a
 current claim.
 
+## Supply chain
+
+How the package you install is produced, and how to check it yourself:
+
+- **Zero dependencies.** GhostBus has no runtime dependencies at all —
+  there is no dependency tree to compromise, substitute, or audit.
+  `npm audit` on an installed copy reports 0 vulnerabilities because
+  there is nothing to have one. (The repository carries no lockfile for
+  the same reason; `npm audit` needs one, so run it on an installed
+  copy, or in a scratch copy with `npm i --package-lock-only` first.)
+- **No stored npm token.** Releases publish from GitHub Actions via npm
+  Trusted Publishing (OIDC): the workflow proves its identity to npm
+  for that one run, and no long-lived publish credential exists
+  anywhere to steal. The workflow runs in the protected `npm`
+  environment and holds the minimum permissions it needs
+  (`contents: read`, `id-token: write`).
+- **Actions pinned by commit SHA.** The third-party GitHub Actions the
+  workflows use (`actions/checkout`, `actions/setup-node`) are pinned
+  to full commit SHAs with the resolved release noted in a comment —
+  a retagged or compromised tag cannot change what runs.
+- **Provenance attestations.** Every release since v0.5.5 carries an
+  SLSA provenance attestation (predicate `https://slsa.dev/provenance/v1`)
+  and registry signatures, visible in the registry metadata
+  (`dist.attestations`) and as the provenance badge on the npm package
+  page. To verify an installed copy: `npm audit signatures`.
+- **The tarball is allowlisted.** `scripts/check-pack.mjs` asserts the
+  exact shape of what publishes — runtime (`src/`), docs, examples,
+  and top-level project files only; tests, deploy kits, dev scripts,
+  CI config, and runtime state are forbidden — and it runs both in the
+  test suite and as a gate in the publish workflow. `SECURITY.md`
+  itself ships in the tarball so this page travels with the code.
+
 ## Scope notes
 
 - Self-hosted deployments are operated by whoever runs them; the operator

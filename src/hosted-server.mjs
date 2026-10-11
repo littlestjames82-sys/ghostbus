@@ -23,13 +23,17 @@
  *   to act. GHOSTBUS_REQUIRE_TOKENS=0 is the only opt-out and starts with a
  *   loud warning. GHOSTBUS_ADMIN_KEY is required and must be at least 16
  *   characters — it is the operator root key (see docs/hosted.md).
+ * - v0.5.3: workspace-key checks are timing-safe, failed auth is throttled
+ *   per IP at this layer, JSON bodies are capped at 1 MB (413), registry +
+ *   workspace files are written 0600, HTML pages carry CSP/frame headers,
+ *   and every admin action is audit-logged to stderr (never keys/hashes).
  */
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { createBus, FileStore, GHOSTBUS_VERSION, validateSnapshot } from './core.mjs';
-import { createBusHandler, keyMatches } from './handler.mjs';
+import { createBusHandler, keyMatches, hashMatches, readJsonBody, MAX_BODY_BYTES, HTML_SECURITY_HEADERS } from './handler.mjs';
 
 const argv = process.argv.slice(2);
 const argVal = (flag) => { const i = argv.indexOf(flag); return i >= 0 ? argv[i + 1] : null; };
@@ -62,9 +66,11 @@ const loadRegistry = () => { try { return JSON.parse(fs.readFileSync(registryPat
 const saveRegistry = (reg) => {
   // Unique temp per save: two processes sharing this registry must never
   // collide on one fixed '.tmp' name (first rename wins, second throws ENOENT).
+  // The registry holds every workspace's key hash — owner-only (0600, v0.5.3).
   const tmp = registryPath + '.tmp.' + process.pid + '.' + Math.random().toString(36).slice(2, 10);
   try {
-    fs.writeFileSync(tmp, JSON.stringify(reg, null, 2));
+    fs.writeFileSync(tmp, JSON.stringify(reg, null, 2), { mode: 0o600 });
+    try { fs.chmodSync(tmp, 0o600); } catch { /* mode already applied on create */ }
     fs.renameSync(tmp, registryPath);
   } finally {
     try { fs.unlinkSync(tmp); } catch { /* already renamed away */ }
@@ -98,8 +104,37 @@ const wsKeyOk = (req, meta) => {
   const given = req.headers['x-bus-key'] || String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
   if (!given) return false;
   if (keyMatches(given, ADMIN_KEY)) return true; // master key
-  return sha256(given) === meta.keyHash;
+  return hashMatches(given, meta.keyHash); // timing-safe vs the stored hash (v0.5.3)
 };
+
+// Failed-auth throttle (v0.5.3): the in-workspace handler limiter (300/min)
+// throttles traffic that is already inside a workspace, but nothing slowed
+// down *guessing* at the hosted layer — admin keys and workspace keys were
+// unthrottled. Track FAILED auth per IP; past the limit, admin + workspace
+// routes answer 429 until the window rolls. Successful auth never counts.
+const AUTH_FAIL_LIMIT = 30;            // failed auth attempts per window per IP
+const AUTH_FAIL_WINDOW_MS = 60_000;    // one-minute window
+const authFails = new Map(); // ip -> {start, count}
+const clientIp = (req) => (req.socket && req.socket.remoteAddress) || 'unknown';
+const authThrottled = (ip) => {
+  const b = authFails.get(ip);
+  return !!b && Date.now() - b.start <= AUTH_FAIL_WINDOW_MS && b.count >= AUTH_FAIL_LIMIT;
+};
+const noteAuthFail = (ip) => {
+  const t = Date.now();
+  let b = authFails.get(ip);
+  if (!b || t - b.start > AUTH_FAIL_WINDOW_MS) { b = { start: t, count: 0 }; authFails.set(ip, b); }
+  b.count += 1;
+};
+
+// Operator audit trail (v0.5.3): one structured stderr line per admin
+// action, so a paid host has a record of who did what to which workspace.
+// NEVER log keys or hashes — ids, actions, timestamps, source IPs only.
+const audit = (action, id, req) => {
+  process.stderr.write(JSON.stringify({ ts: new Date().toISOString(), audit: 'admin', action, workspace: id, ip: clientIp(req) }) + '\n');
+};
+
+const TOO_LARGE = Symbol('body-too-large');
 
 const LANDING = `<!doctype html><html><head><meta charset="utf-8"><title>GhostBus Hosted</title>
 <style>body{font-family:system-ui;background:#0e0c14;color:#ece8f5;margin:0;padding:40px}h1{font-size:22px}code{background:#17131f;padding:2px 7px;border-radius:6px;color:#c9b8ff}p{color:#9b8fb5;max-width:640px;line-height:1.55}</style></head>
@@ -116,19 +151,34 @@ const server = http.createServer(async (req, res) => {
   };
   res.setHeader('x-content-type-options', 'nosniff');
   res.setHeader('referrer-policy', 'no-referrer');
-  const readBody = () => new Promise((resolve) => {
-    let data = ''; req.on('data', c => { data += c; if (data.length > 5_000_000) req.destroy(); });
-    req.on('end', () => { try { resolve(data ? JSON.parse(data) : {}); } catch { resolve(null); } });
-  });
+  const ip = clientIp(req);
+  const adminDenied = () => { noteAuthFail(ip); return send(401, { error: 'admin key required' }); };
+  const readBody = async () => {
+    try { return await readJsonBody(req); }
+    catch (e) {
+      if (e && e.code === 'BODY_TOO_LARGE') {
+        try {
+          res.writeHead(413, { 'content-type': 'application/json', connection: 'close' });
+          res.end(JSON.stringify({ error: `request body too large (limit ${MAX_BODY_BYTES} bytes)` }), () => { try { req.destroy(); } catch {} });
+        } catch {}
+        return TOO_LARGE;
+      }
+      throw e;
+    }
+  };
 
   try {
-    if (req.method === 'GET' && url.pathname === '/') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); return res.end(LANDING); }
+    if (req.method === 'GET' && url.pathname === '/') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', ...HTML_SECURITY_HEADERS }); return res.end(LANDING); }
     if (req.method === 'GET' && url.pathname === '/health') return send(200, { ok: true, server: 'ghostbus-hosted', version: GHOSTBUS_VERSION, workspaces: Object.keys(loadRegistry().workspaces).length });
 
     // ---- admin ----
+    // Failed-auth throttle (v0.5.3): sustained key guessing gets 429s on the
+    // whole admin surface before any key is even compared.
+    if (url.pathname.startsWith('/api/workspaces') && authThrottled(ip)) return send(429, { error: 'too many failed auth attempts — try again shortly' });
     if (url.pathname === '/api/workspaces' && req.method === 'POST') {
-      if (!isAdmin(req)) return send(401, { error: 'admin key required' });
+      if (!isAdmin(req)) return adminDenied();
       const body = await readBody();
+      if (body === TOO_LARGE) return; // 413 already sent
       if (!body) return send(400, { error: 'invalid JSON body' });
       const reg = loadRegistry();
       const id = body.id || `ws-${crypto.randomBytes(4).toString('hex')}`;
@@ -137,10 +187,11 @@ const server = http.createServer(async (req, res) => {
       const key = crypto.randomBytes(24).toString('hex');
       reg.workspaces[id] = { name: String(body.name || id).slice(0, 120), keyHash: sha256(key), createdAt: new Date().toISOString() };
       saveRegistry(reg);
+      audit('create', id, req);
       return send(201, { id, name: reg.workspaces[id].name, key, keyNote: 'Workspace key — shown ONCE, only its hash is stored. Agents use it as x-bus-key (or Bearer) under /w/' + id + '/.', board: `/w/${id}/` });
     }
     if (url.pathname === '/api/workspaces' && req.method === 'GET') {
-      if (!isAdmin(req)) return send(401, { error: 'admin key required' });
+      if (!isAdmin(req)) return adminDenied();
       const reg = loadRegistry();
       const out = [];
       for (const [id, meta] of Object.entries(reg.workspaces)) {
@@ -152,7 +203,7 @@ const server = http.createServer(async (req, res) => {
     }
     const rotateMatch = url.pathname.match(/^\/api\/workspaces\/([a-z0-9-]+)\/rotate-key$/);
     if (req.method === 'POST' && rotateMatch) {
-      if (!isAdmin(req)) return send(401, { error: 'admin key required' });
+      if (!isAdmin(req)) return adminDenied();
       const reg = loadRegistry();
       const id = rotateMatch[1];
       if (!reg.workspaces[id]) return send(404, { error: `no such workspace: ${id}` });
@@ -163,20 +214,23 @@ const server = http.createServer(async (req, res) => {
       // Refresh the cached meta so the old key dies immediately, not on restart.
       const cached = buses.get(id);
       if (cached) cached.meta = reg.workspaces[id];
+      audit('rotate-key', id, req);
       return send(200, { id, key, keyNote: 'New workspace key — shown ONCE. The previous key is invalid from this moment.', keyRotatedAt: reg.workspaces[id].keyRotatedAt });
     }
     const exportMatch = url.pathname.match(/^\/api\/workspaces\/([a-z0-9-]+)\/export$/);
     if (req.method === 'GET' && exportMatch) {
-      if (!isAdmin(req)) return send(401, { error: 'admin key required' });
+      if (!isAdmin(req)) return adminDenied();
       const id = exportMatch[1];
       const w = await getWorkspace(id);
       if (!w) return send(404, { error: `no such workspace: ${id}` });
       const state = await w.bus.snapshot();
+      audit('export', id, req);
       return send(200, { ghostbusExport: 1, version: GHOSTBUS_VERSION, exportedAt: new Date().toISOString(), workspace: { id, name: w.meta.name }, state });
     }
     if (url.pathname === '/api/workspaces/import' && req.method === 'POST') {
-      if (!isAdmin(req)) return send(401, { error: 'admin key required' });
+      if (!isAdmin(req)) return adminDenied();
       const body = await readBody();
+      if (body === TOO_LARGE) return; // 413 already sent
       if (!body) return send(400, { error: 'invalid JSON body' });
       // Accept either a full export envelope or a bare {state} / raw state.
       const env = body.ghostbusExport ? body : null;
@@ -195,15 +249,17 @@ const server = http.createServer(async (req, res) => {
       // the bus sees exactly what a restart would see.
       const file = path.join(dataDir, `${id}.json`);
       const tmp = file + '.tmp.' + process.pid + '.' + Math.random().toString(36).slice(2, 10);
-      fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+      fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 }); // state file: owner-only (v0.5.3)
+      try { fs.chmodSync(tmp, 0o600); } catch { /* mode already applied on create */ }
       fs.renameSync(tmp, file);
+      audit('import', id, req);
       const w = await getWorkspace(id);
       const status = await w.bus.status();
       return send(201, { id, name, key, keyNote: 'Workspace key — shown ONCE, only its hash is stored. Imported workspaces always get a FRESH key; the source key is not carried over.', agents: status.agents, messages: status.messages, tasks: status.tasks.total, board: `/w/${id}/` });
     }
     const delMatch = url.pathname.match(/^\/api\/workspaces\/([a-z0-9-]+)$/);
     if (req.method === 'DELETE' && delMatch) {
-      if (!isAdmin(req)) return send(401, { error: 'admin key required' });
+      if (!isAdmin(req)) return adminDenied();
       const reg = loadRegistry();
       const id = delMatch[1];
       if (!reg.workspaces[id]) return send(404, { error: `no such workspace: ${id}` });
@@ -211,6 +267,7 @@ const server = http.createServer(async (req, res) => {
       saveRegistry(reg);
       buses.delete(id); handlers.delete(id);
       try { fs.unlinkSync(path.join(dataDir, `${id}.json`)); } catch {}
+      audit('delete', id, req);
       return send(200, { id, deleted: true });
     }
 
@@ -224,13 +281,15 @@ const server = http.createServer(async (req, res) => {
       sub.pathname = wMatch[2] || '/';
       // Open surfaces mirror the single relay: board page, health, probe.
       const open = sub.pathname === '/' || sub.pathname === '/health' || sub.pathname === '/probe';
-      if (!open && !wsKeyOk(req, w.meta)) return send(401, { error: 'missing or wrong workspace key' });
+      if (!open && authThrottled(ip)) return send(429, { error: 'too many failed auth attempts — try again shortly' });
+      if (!open && !wsKeyOk(req, w.meta)) { noteAuthFail(ip); return send(401, { error: 'missing or wrong workspace key' }); }
       return handlerFor(id, w.bus)(req, res, sub);
     }
 
     return send(404, { error: 'not found' });
   } catch (e) {
-    return send(500, { error: e.message });
+    process.stderr.write(`ghostbus hosted: internal error: ${(e && e.stack) || e}\n`);
+    return send(500, { error: 'internal error' });
   }
 });
 

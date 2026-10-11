@@ -24,6 +24,56 @@ const hashEq = (given, expected) => {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 };
 export const keyMatches = (given, expected) => !!expected && !!given && hashEq(given, expected);
+// Timing-safe check of a presented secret against a STORED sha256 hex digest
+// (v0.5.3) — the hosted router and the core token check compare against
+// hashes at rest, never against raw keys.
+export const hashMatches = (given, storedHashHex) => {
+  if (!given || !storedHashHex) return false;
+  const a = Buffer.from(crypto.createHash('sha256').update(String(given)).digest('hex'));
+  const b = Buffer.from(String(storedHashHex));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+};
+
+// JSON request-body cap (v0.5.3): file contents travel inside JSON bodies in
+// this codebase, so 1 MB is generous for messages/tasks/files while keeping
+// a single request from exhausting memory. Over the cap the reader rejects
+// with code BODY_TOO_LARGE and the route answers 413.
+export const MAX_BODY_BYTES = 1_000_000;
+export function readJsonBody(req, limit = MAX_BODY_BYTES) {
+  return new Promise((resolve, reject) => {
+    let size = 0; let done = false;
+    const chunks = [];
+    req.on('data', (c) => {
+      if (done) return;
+      size += c.length;
+      if (size > limit) {
+        done = true;
+        req.pause(); // stop reading; the route answers 413 and drops the socket
+        reject(Object.assign(new Error(`request body too large (limit ${limit} bytes)`), { code: 'BODY_TOO_LARGE' }));
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      if (done) return; done = true;
+      const data = Buffer.concat(chunks).toString('utf8');
+      try { resolve(data ? JSON.parse(data) : {}); } catch { resolve(null); }
+    });
+    req.on('error', () => { if (!done) { done = true; resolve(null); } });
+  });
+}
+
+// Headers for the HTML pages (board + hosted landing), v0.5.3. Both pages are
+// single self-contained documents: inline <script>/<style> and same-origin
+// fetches only, zero external resources — so the CSP allows 'unsafe-inline'
+// for script/style specifically (no eval, no external origins, no plugins)
+// and forbids framing outright.
+export const HTML_SECURITY_HEADERS = {
+  'x-frame-options': 'DENY',
+  'content-security-policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; object-src 'none'",
+};
+
+const TOO_LARGE = Symbol('body-too-large');
 
 export function createBusHandler({ id = 'default', bus, key = '' }) {
   const buckets = new Map();
@@ -51,13 +101,19 @@ export function createBusHandler({ id = 'default', bus, key = '' }) {
     if (!rateOk(req) && url.pathname !== '/health' && url.pathname !== '/probe') {
       return send(429, { error: 'rate limit: 300 requests/min per IP per workspace' });
     }
-    const readBody = () => new Promise((resolve) => {
-      let data = ''; req.on('data', c => { data += c; if (data.length > 5_000_000) req.destroy(); });
-      req.on('end', () => { try { resolve(data ? JSON.parse(data) : {}); } catch { resolve(null); } });
-    });
+    const send413 = () => {
+      try {
+        res.writeHead(413, { 'content-type': 'application/json', connection: 'close' });
+        res.end(JSON.stringify({ error: `request body too large (limit ${MAX_BODY_BYTES} bytes)` }), () => { try { req.destroy(); } catch {} });
+      } catch {}
+    };
+    const readBody = async () => {
+      try { return await readJsonBody(req); }
+      catch (e) { if (e && e.code === 'BODY_TOO_LARGE') { send413(); return TOO_LARGE; } throw e; }
+    };
 
     try {
-      if (req.method === 'GET' && url.pathname === '/') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); return res.end(BOARD_HTML); }
+      if (req.method === 'GET' && url.pathname === '/') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', ...HTML_SECURITY_HEADERS }); return res.end(BOARD_HTML); }
       if (req.method === 'GET' && url.pathname === '/health') return send(200, { ok: true, server: 'ghostbus', workspace: id, version: GHOSTBUS_VERSION });
       if (req.method === 'GET' && url.pathname === '/probe') {
         const s = await bus.status();
@@ -103,6 +159,7 @@ export function createBusHandler({ id = 'default', bus, key = '' }) {
 
       if (req.method === 'POST' && url.pathname === '/mcp') {
         const msg = await readBody();
+        if (msg === TOO_LARGE) return; // 413 already sent
         if (!msg) return send(400, { error: 'invalid JSON body' });
         if (msg.method === 'tools/list') return send(200, { jsonrpc: '2.0', id: msg.id, result: { tools: TOOLS } });
         if (msg.method === 'tools/call') {
@@ -118,6 +175,7 @@ export function createBusHandler({ id = 'default', bus, key = '' }) {
       }
 
       const body = ['POST', 'PUT', 'DELETE'].includes(req.method) ? await readBody().catch(() => ({})) : {};
+      if (body === TOO_LARGE) return; // 413 already sent
       const safeBody = body && typeof body === 'object' ? body : {};
       const q = Object.fromEntries(url.searchParams);
 

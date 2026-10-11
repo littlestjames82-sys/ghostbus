@@ -30,7 +30,7 @@ const handle = createBusHandler({ id: 'default', bus, key: KEY });
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://localhost');
-  handle(req, res, url).catch((e) => { try { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: e.message })); } catch {} });
+  handle(req, res, url).catch((e) => { process.stderr.write(`ghostbus relay: internal error: ${(e && e.stack) || e}\n`); try { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'internal error' })); } catch {} });
 });
 server.listen(port, () => {
   process.stderr.write(`ghostbus http relay v${GHOSTBUS_VERSION} · http://127.0.0.1:${port} · store=${storePath} · auth=${KEY ? 'workspace key required' : 'open (set GHOSTBUS_KEY)'}\n`);

@@ -14,8 +14,14 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 
-export const GHOSTBUS_VERSION = '0.5.2';
+export const GHOSTBUS_VERSION = '0.5.3';
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
+// Timing-safe equality for hex digests (v0.5.3): secret comparisons must not
+// short-circuit on the first differing character the way === does.
+const hashEqHex = (aHex, bHex) => {
+  const a = Buffer.from(String(aHex)); const b = Buffer.from(String(bHex));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+};
 export const TASK_STATUSES = ['queued', 'claimed', 'needs-approval', 'done', 'cancelled'];
 const CLAIM_LEASE_MS = 15 * 60 * 1000;
 
@@ -62,7 +68,11 @@ export class FileStore {
       await fs.promises.mkdir(path.dirname(this.file), { recursive: true });
       const tmp = this.file + '.tmp.' + process.pid + '.' + Math.random().toString(36).slice(2, 10);
       try {
-        await fs.promises.writeFile(tmp, JSON.stringify(state, null, 2));
+        // State files hold token hashes — owner-only (0600) from birth
+        // (v0.5.3). The mode rides through the atomic rename; the chmod
+        // covers filesystems/umasks that would otherwise widen it.
+        await fs.promises.writeFile(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
+        await fs.promises.chmod(tmp, 0o600).catch(() => {});
         await fs.promises.rename(tmp, this.file); // atomic replace
       } finally {
         await fs.promises.unlink(tmp).catch(() => {});
@@ -160,7 +170,7 @@ export class GhostBus {
     const a = this._agent(name);
     if (!a) throw Object.assign(new Error(`agent not registered: ${name}`), { code: 'UNKNOWN_AGENT' });
     if (this.requireTokens && a.tokenHash) {
-      if (!token || sha256(token) !== a.tokenHash) {
+      if (!token || !hashEqHex(sha256(token), a.tokenHash)) {
         throw Object.assign(new Error(`agent token required or wrong for: ${name}`), { code: 'AGENT_AUTH' });
       }
     }

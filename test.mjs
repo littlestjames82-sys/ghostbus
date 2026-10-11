@@ -677,6 +677,106 @@ await check('http relay (v0.5.2): no GHOSTBUS_KEY -> loud warning that it listen
   } finally { proc.kill(); }
 });
 
+await check('hosted hardening (v0.5.3): HTML pages carry CSP/frame headers, data files are 0600, admin actions are audit-logged', async () => {
+  const dataDir = path.join(tmp, 'hosted-hardening');
+  const env = { ...process.env, GHOSTBUS_ADMIN_KEY: 'vault-admin-secret-1' };
+  const proc = spawn('node', ['src/hosted-server.mjs', '--port', '18388', '--data-dir', dataDir], { cwd: new URL('.', import.meta.url).pathname, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  let err = '';
+  proc.stderr.on('data', d => { err += d; });
+  const A = { 'content-type': 'application/json', 'x-bus-key': 'vault-admin-secret-1' };
+  const J = (r) => r.json();
+  try {
+    for (let i = 0; i < 50; i++) { try { const r = await fetch('http://127.0.0.1:18388/health'); if (r.ok) break; } catch {} await new Promise(r => setTimeout(r, 100)); }
+    // landing page: frame + CSP headers
+    const landing = await fetch('http://127.0.0.1:18388/');
+    assert.equal(landing.status, 200);
+    assert.equal(landing.headers.get('x-frame-options'), 'DENY');
+    assert.match(landing.headers.get('content-security-policy') || '', /frame-ancestors 'none'/);
+    await landing.text();
+    // create + use a workspace so its state file exists
+    const c = await J(await fetch('http://127.0.0.1:18388/api/workspaces', { method: 'POST', headers: A, body: JSON.stringify({ id: 'vault', name: 'Vault Team' }) }));
+    const K = { 'content-type': 'application/json', 'x-bus-key': c.key };
+    // workspace board carries the same headers and still renders
+    const board = await fetch('http://127.0.0.1:18388/w/vault/');
+    assert.equal(board.status, 200);
+    assert.equal(board.headers.get('x-frame-options'), 'DENY');
+    assert.match(board.headers.get('content-security-policy') || '', /default-src 'self'/);
+    assert.match(await board.text(), /GhostBus Board/);
+    // right key works / wrong key refused on the timing-safe compare
+    assert.equal((await fetch('http://127.0.0.1:18388/w/vault/api/status', { headers: K })).status, 200);
+    assert.equal((await fetch('http://127.0.0.1:18388/w/vault/api/status', { headers: { 'x-bus-key': 'not-the-vault-key' } })).status, 401);
+    const reg = await J(await fetch('http://127.0.0.1:18388/w/vault/api/agents', { method: 'POST', headers: K, body: JSON.stringify({ agent: 'vault-agent' }) }));
+    await fetch('http://127.0.0.1:18388/w/vault/api/messages', { method: 'POST', headers: { ...K, 'x-agent-token': reg.token }, body: JSON.stringify({ agent: 'vault-agent', to: '*', body: 'perms probe' }) });
+    // registry + workspace state files are owner-only
+    for (const f of ['registry.json', 'vault.json']) {
+      const mode = fs.statSync(path.join(dataDir, f)).mode & 0o777;
+      assert.equal(mode, 0o600, `${f} must be 0600, got ${mode.toString(8)}`);
+    }
+    // rotate + delete, then the audit trail must name all three actions
+    await fetch('http://127.0.0.1:18388/api/workspaces/vault/rotate-key', { method: 'POST', headers: A, body: '{}' });
+    await fetch('http://127.0.0.1:18388/api/workspaces/vault', { method: 'DELETE', headers: A });
+    await new Promise(r => setTimeout(r, 150)); // let stderr flush
+    for (const action of ['create', 'rotate-key', 'delete']) {
+      assert.match(err, new RegExp(`"audit":"admin","action":"${action}","workspace":"vault"`), `missing audit line for ${action}`);
+    }
+    // ... and never a key, hash, or secret
+    assert.ok(!err.includes(c.key), 'audit log must not contain the workspace key');
+    assert.ok(!err.includes('vault-admin-secret-1'), 'audit log must not contain the admin key');
+  } finally { proc.kill(); }
+});
+
+await check('hardening (v0.5.3): JSON bodies over 1 MB -> 413 on hosted admin, in-workspace, and single-relay routes', async () => {
+  const dataDir = path.join(tmp, 'hosted-bigbody');
+  const env = { ...process.env, GHOSTBUS_ADMIN_KEY: 'bigbody-admin-secret' };
+  const proc = spawn('node', ['src/hosted-server.mjs', '--port', '18389', '--data-dir', dataDir], { cwd: new URL('.', import.meta.url).pathname, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const relay = spawn('node', ['src/http-server.mjs', '--port', '18390', '--store', ':memory:'], { cwd: new URL('.', import.meta.url).pathname, env: { ...process.env }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const A = { 'content-type': 'application/json', 'x-bus-key': 'bigbody-admin-secret' };
+  const J = (r) => r.json();
+  const big = 'x'.repeat(1_100_000);
+  try {
+    for (let i = 0; i < 50; i++) { try { const r = await fetch('http://127.0.0.1:18389/health'); if (r.ok) break; } catch {} await new Promise(r => setTimeout(r, 100)); }
+    for (let i = 0; i < 50; i++) { try { const r = await fetch('http://127.0.0.1:18390/health'); if (r.ok) break; } catch {} await new Promise(r => setTimeout(r, 100)); }
+    // hosted admin route
+    const h = await fetch('http://127.0.0.1:18389/api/workspaces', { method: 'POST', headers: A, body: JSON.stringify({ id: 'big', name: big }) });
+    assert.equal(h.status, 413);
+    assert.match((await J(h)).error, /too large/);
+    // in-workspace route (shared handler)
+    const c = await J(await fetch('http://127.0.0.1:18389/api/workspaces', { method: 'POST', headers: A, body: JSON.stringify({ id: 'bigws' }) }));
+    const K = { 'content-type': 'application/json', 'x-bus-key': c.key };
+    const w = await fetch('http://127.0.0.1:18389/w/bigws/api/files', { method: 'PUT', headers: K, body: JSON.stringify({ agent: 'a', path: 'big.txt', text: big }) });
+    assert.equal(w.status, 413);
+    // single relay route (same handler, other server)
+    const r = await fetch('http://127.0.0.1:18390/api/files', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ agent: 'a', path: 'big.txt', text: big }) });
+    assert.equal(r.status, 413);
+    assert.match((await J(r)).error, /too large/);
+    // a normal small body still works everywhere afterwards
+    assert.equal((await fetch('http://127.0.0.1:18389/w/bigws/api/status', { headers: K })).status, 200);
+  } finally { proc.kill(); relay.kill(); }
+});
+
+await check('hosted hardening (v0.5.3): failed-auth throttle — 30 bad auths/min from one IP -> 429 on admin + workspace routes', async () => {
+  const dataDir = path.join(tmp, 'hosted-throttle');
+  const env = { ...process.env, GHOSTBUS_ADMIN_KEY: 'throttle-admin-secret' };
+  const proc = spawn('node', ['src/hosted-server.mjs', '--port', '18391', '--data-dir', dataDir], { cwd: new URL('.', import.meta.url).pathname, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const A = { 'content-type': 'application/json', 'x-bus-key': 'throttle-admin-secret' };
+  const J = (r) => r.json();
+  try {
+    for (let i = 0; i < 50; i++) { try { const r = await fetch('http://127.0.0.1:18391/health'); if (r.ok) break; } catch {} await new Promise(r => setTimeout(r, 100)); }
+    const c = await J(await fetch('http://127.0.0.1:18391/api/workspaces', { method: 'POST', headers: A, body: JSON.stringify({ id: 'throttle' }) }));
+    const BAD = { 'x-bus-key': 'guessed-key-000000' };
+    // 30 failed workspace auths: all plain 401s, none throttled yet
+    for (let i = 0; i < 30; i++) {
+      assert.equal((await fetch('http://127.0.0.1:18391/w/throttle/api/status', { headers: BAD })).status, 401, `attempt ${i + 1}`);
+    }
+    // the throttle is now tripped for this IP: even the CORRECT key gets 429
+    assert.equal((await fetch('http://127.0.0.1:18391/w/throttle/api/status', { headers: { 'x-bus-key': c.key } })).status, 429);
+    // ... and so does the admin surface
+    assert.equal((await fetch('http://127.0.0.1:18391/api/workspaces', { headers: A })).status, 429);
+    // open surfaces stay open (health is how operators notice an attack)
+    assert.equal((await fetch('http://127.0.0.1:18391/health')).status, 200);
+  } finally { proc.kill(); }
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 fs.rmSync(tmp, { recursive: true, force: true });
 process.exit(fail ? 1 : 0);

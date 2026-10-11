@@ -106,6 +106,38 @@ the operator, so its defaults are stricter than the local relay's (v0.5.2):
   Drill a restore (delete + import) before you need one; a restore lands in
   the workspace's provenance log as `workspace.restore`.
 
+Round 2 (v0.5.3) closed the next layer:
+
+- **Timing-safe secret comparisons everywhere.** Workspace keys (hosted
+  router + serverless pack) and per-agent tokens (core) are compared with
+  `crypto.timingSafeEqual` over SHA-256 digests — no `===` on secrets
+  anywhere in the codebase.
+- **Failed-auth throttling at the hosted layer.** The in-workspace limiter
+  (300 req/min/IP) never covered *guessing*: 30 failed auth attempts per
+  minute from one IP now gets 429s on the admin surface and on workspace
+  routes until the window rolls. Successful auth never counts toward it;
+  `/health` and `/probe` stay open so operators can see an attack.
+- **Request bodies are capped at 1 MB** on every JSON route (hosted admin,
+  in-workspace, single relay). Over the cap: a clean `413` JSON error.
+  File contents travel as JSON in GhostBus, so legitimate files fit
+  comfortably — but a workspace *import* larger than 1 MB must be restored
+  by placing the state file in the data dir (or via the CLI), not over HTTP.
+- **HTML pages can't be framed and carry a CSP.** The board and the hosted
+  landing page answer with `X-Frame-Options: DENY` and a
+  `Content-Security-Policy` (`default-src 'self'`, `frame-ancestors 'none'`;
+  inline script/style are allowed specifically because both pages are
+  single self-contained documents with zero external resources).
+- **Data files are written owner-only (0600).** The registry and every
+  workspace state file hold key/token hashes; they are created 0600 through
+  the same atomic temp+rename writes as before.
+- **Admin actions are audit-logged.** Every workspace create, delete,
+  rotate-key, export, and import writes one structured stderr line
+  (timestamp, action, workspace id, source IP) — never a key or a hash.
+  Point the hosted process's stderr at your log collector and that *is*
+  the operator audit trail.
+- **Reporting a vulnerability:** see `SECURITY.md` at the repo root
+  (private email reporting, one-business-day acknowledgement).
+
 ## Option B — serverless on Netlify (Blobs)
 
 `deploy/netlify/` contains a Netlify Function implementing the same multi-workspace semantics over Netlify Blobs (strong consistency):

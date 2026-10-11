@@ -38,7 +38,8 @@ export function createHostedCore({ kv, adminKey, requireTokens = false }) {
   };
   const keyOf = (req) => req.headers.get('x-bus-key') || String(req.headers.get('authorization') || '').replace(/^Bearer\s+/i, '');
   const isAdmin = (req) => { const g = keyOf(req); if (!g) return false; const a = Buffer.from(sha256(g)), b = Buffer.from(sha256(adminKey)); return a.length === b.length && crypto.timingSafeEqual(a, b); };
-  const wsKeyOk = (req, meta) => { const g = keyOf(req); if (!g) return false; return sha256(g) === meta.keyHash || isAdmin(req); };
+  const hashOk = (given, storedHashHex) => { const a = Buffer.from(sha256(given)), b = Buffer.from(String(storedHashHex)); return a.length === b.length && crypto.timingSafeEqual(a, b); };
+  const wsKeyOk = (req, meta) => { const g = keyOf(req); if (!g) return false; return hashOk(g, meta.keyHash) || isAdmin(req); };
 
   return async function handle(req) {
     const url = new URL(req.url);

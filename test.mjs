@@ -1360,6 +1360,67 @@ await check('recovery drill (v0.5.6): SIGKILL mid-load, restart on the same data
   } finally { proc.kill('SIGKILL'); }
 });
 
+/* ---------------- token lifecycle (v0.5.7) ---------------- */
+console.log('token lifecycle:');
+await check('hosted tokens (v0.5.7): REST rotation is immediate; delivered credentials are 192-bit hex; events + export carry hashes only', async () => {
+  const dataDir = path.join(tmp, 'hosted-tokens');
+  const env = { ...process.env, GHOSTBUS_ADMIN_KEY: 'tokens-admin-secret-0123' };
+  delete env.GHOSTBUS_REQUIRE_TOKENS; // hosted default: enforcement on
+  const proc = spawn('node', ['src/hosted-server.mjs', '--port', '18415', '--data-dir', dataDir], { cwd: new URL('.', import.meta.url).pathname, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  let err = '';
+  proc.stderr.on('data', d => { err += d; });
+  const A = { 'content-type': 'application/json', 'x-bus-key': 'tokens-admin-secret-0123' };
+  const J = (r) => r.json();
+  try {
+    for (let i = 0; i < 50; i++) { try { const r = await fetch('http://127.0.0.1:18415/health'); if (r.ok) break; } catch {} await new Promise(r => setTimeout(r, 100)); }
+    const c = await J(await fetch('http://127.0.0.1:18415/api/workspaces', { method: 'POST', headers: A, body: JSON.stringify({ id: 'tok', name: 'Tokens' }) }));
+    // delivered credentials are crypto-random hex from randomBytes(24):
+    // 48 lowercase hex chars (192 bits) — format asserted, values never printed
+    assert.match(c.key, /^[0-9a-f]{48}$/, 'workspace key must be 48 hex chars');
+    const K = { 'content-type': 'application/json', 'x-bus-key': c.key };
+    const reg = await J(await fetch('http://127.0.0.1:18415/w/tok/api/agents', { method: 'POST', headers: K, body: JSON.stringify({ agent: 'tok-agent', role: 't' }) }));
+    assert.match(reg.token, /^[0-9a-f]{48}$/, 'agent token must be 48 hex chars');
+    const act = (token) => fetch('http://127.0.0.1:18415/w/tok/api/messages', { method: 'POST', headers: token ? { ...K, 'x-agent-token': token } : K, body: JSON.stringify({ agent: 'tok-agent', to: '*', body: 'act' }) });
+    assert.equal((await act(reg.token)).status, 200);
+    // rotation requires the CURRENT token — a name alone cannot rotate a
+    // (possibly leaked-token) identity out from under its owner
+    const noTokRot = await fetch('http://127.0.0.1:18415/w/tok/api/agents/rotate-token', { method: 'POST', headers: K, body: JSON.stringify({ agent: 'tok-agent' }) });
+    assert.equal(noTokRot.status, 400);
+    // the REST route (new in v0.5.7 — rotation used to be MCP-only): the
+    // old token is dead on the VERY NEXT request after the rotation reply
+    const rotRes = await fetch('http://127.0.0.1:18415/w/tok/api/agents/rotate-token', { method: 'POST', headers: { ...K, 'x-agent-token': reg.token }, body: JSON.stringify({ agent: 'tok-agent' }) });
+    assert.equal(rotRes.status, 200, 'REST rotate-token route must exist');
+    const rot = await J(rotRes);
+    assert.match(rot.token, /^[0-9a-f]{48}$/);
+    assert.notEqual(rot.token, reg.token);
+    const dead = await act(reg.token);
+    assert.equal(dead.status, 400);
+    assert.match((await J(dead)).error, /token required or wrong/);
+    assert.equal((await act(rot.token)).status, 200);
+    // the provenance log NAMES the rotation but never carries a token —
+    // events are readable by every workspace member, so a token there
+    // would be a cross-agent compromise
+    const evText = JSON.stringify((await J(await fetch('http://127.0.0.1:18415/w/tok/api/events?limit=100', { headers: K }))).events);
+    assert.ok(evText.includes('agent.token_rotate'), 'rotation must be in the provenance log');
+    assert.ok(!evText.includes(reg.token) && !evText.includes(rot.token), 'a raw agent token leaked into the event log');
+    // the export envelope: agent credentials travel as hashes ONLY, and
+    // the hashes are SHA-256 of 192-bit random tokens — not offline-
+    // brute-forceable, so an export is a backup, not a credential
+    const expRes = await fetch('http://127.0.0.1:18415/api/workspaces/tok/export', { headers: A });
+    assert.equal(expRes.status, 200);
+    const expText = await expRes.text();
+    assert.ok(expText.includes('tokenHash'), 'export should carry agent token hashes (as at rest)');
+    assert.ok(!expText.includes(rot.token) && !expText.includes(reg.token), 'a raw agent token leaked into the export');
+    assert.ok(!expText.includes(c.key) && !expText.includes('tokens-admin-secret-0123'), 'a key leaked into the export');
+    const expState = JSON.parse(expText).state;
+    assert.match(expState.agents.find(a => a.name === 'tok-agent').tokenHash, /^[0-9a-f]{64}$/, 'stored credential must be a sha256 hex digest');
+    // normal server output (incl. the v0.5.3 audit lines) never carries secrets
+    await new Promise(r => setTimeout(r, 150));
+    assert.ok(!err.includes(rot.token) && !err.includes(reg.token), 'an agent token reached server stderr');
+    assert.ok(!err.includes(c.key) && !err.includes('tokens-admin-secret-0123'), 'a key reached server stderr');
+  } finally { proc.kill(); }
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 fs.rmSync(tmp, { recursive: true, force: true });
 process.exit(fail ? 1 : 0);

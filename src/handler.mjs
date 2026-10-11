@@ -306,6 +306,13 @@ export function createBusHandler({ id = 'default', bus, key = '' }) {
       if (req.method === 'GET' && url.pathname === '/api/status') return send(200, await bus.status());
       if (req.method === 'GET' && url.pathname === '/api/agents') return send(200, { agents: await bus.listAgents() });
       if (req.method === 'POST' && url.pathname === '/api/agents') return send(200, await bus.registerAgent({ name: safeBody.agent, role: safeBody.role, capabilities: safeBody.capabilities, token: agentTokenOf(req, safeBody) }));
+      // Agent-token rotation over plain REST (v0.5.7): until this route the
+      // only rotation path was the MCP tool — a pure-REST agent whose token
+      // leaked had no way to rotate it. Same semantics as the core/MCP path:
+      // the current token authorizes (on an enforced bus), the new token is
+      // returned once, and the old hash is replaced before the reply, so the
+      // old token is dead the moment this returns.
+      if (req.method === 'POST' && url.pathname === '/api/agents/rotate-token') return send(200, await bus.rotateAgentToken({ name: safeBody.agent, token: agentTokenOf(req, safeBody) }));
       if (req.method === 'POST' && url.pathname === '/api/messages') return send(200, await bus.sendMessage({ from: safeBody.agent, to: safeBody.to ?? '*', body: safeBody.body, channel: safeBody.channel ?? 'general', threadId: safeBody.threadId ?? null, token: agentTokenOf(req, safeBody) }));
       if (req.method === 'GET' && url.pathname === '/api/inbox') return send(200, { messages: await bus.inbox(q.agent, { unreadOnly: q.unread === '1', limit: Number(q.limit || 50), token: agentTokenOf(req, {}, q) }) });
       if (req.method === 'POST' && url.pathname === '/api/heartbeat') return send(200, await bus.heartbeat({ name: safeBody.agent, token: agentTokenOf(req, safeBody) }));

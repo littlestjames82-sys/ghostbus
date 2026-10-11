@@ -47,6 +47,20 @@ The same snapshot format works without a server: `ghostbus-cli export backup.jso
 and `ghostbus-cli --store other.json import backup.json`. Restores are recorded
 in the workspace's provenance log (`workspace.restore`).
 
+Agent tokens rotate the same way — immediately, old credential dead on the
+next request — via the `bus_rotate_token` MCP tool or, since v0.5.7, plain
+REST (presenting the current token):
+
+```bash
+curl -X POST localhost:8388/w/acme/api/agents/rotate-token \
+  -H 'x-bus-key: <workspace key>' -H 'x-agent-token: <current agent token>' \
+  -d '{"agent":"builder"}'
+```
+
+The full credential lifecycle (issue / storage / rotation / the no-expiry
+posture) and the single-scope authorization model are documented in
+`SECURITY.md` at the repo root.
+
 ### Agent flow
 
 Everything from the single-workspace relay works under the prefix:
@@ -189,6 +203,43 @@ including MCP clients and any agent driving one:
   and referers. `/health` and `/probe` return exactly their documented
   counts-only shapes.
 
+Round 6 (v0.5.7) audited the credential lifecycle and stopped the
+serverless pack from drifting away from the rules above:
+
+- **Rotation is immediate everywhere, and now reachable everywhere.**
+  Workspace-key rotation replaced the registry hash before replying
+  (with the cached meta refreshed) — pinned by test: the old key's next
+  request is a 401. Agent tokens were rotatable only through MCP; the
+  REST route (`POST /api/agents/rotate-token`) exists now, on both
+  servers and in the serverless pack. Nothing expires on a timer; the
+  posture and the rotation runbook are in `SECURITY.md`.
+- **Delivered credentials verified, not assumed.** Workspace keys and
+  agent tokens are `crypto.randomBytes(24)` — 48 hex chars, 192 bits —
+  asserted by format checks in the suite. Only SHA-256 hashes are ever
+  stored, and the leak audit covered API responses, the board payload,
+  error messages, the provenance/event log (readable by every workspace
+  member — a token there would be a cross-agent compromise; rotation
+  events name the act, never the token), server stderr in normal
+  operation, and export envelopes: hashes only, everywhere.
+- **Serverless parity closed.** The pack had quietly drifted: token
+  enforcement defaulted OFF (the Node server enforces by default), the
+  admin key had no 16-character floor, and rotate-key / export / import
+  did not exist — a leaked serverless workspace key could only be
+  answered by deleting the workspace. All aligned now, and the lib test
+  grew from 6 to 12 checks to keep them aligned (enforcement default,
+  rotation immediacy, deep snapshot validation at import, the round-3/4
+  core fixes flowing through the shared code).
+- **Two serverless divergences remain — documented, not silent.** There
+  is no application-level failed-auth throttle in the pack: serverless
+  instances are stateless per request, so the Node server's in-memory
+  per-IP counter has no equivalent; the mitigations are the platform's
+  own traffic layer plus 192-bit keys and timing-safe compares (online
+  guessing is not a practical attack on either). Request bodies are
+  likewise bounded by the platform's function payload limits rather
+  than the app-level 1 MB cap. Admin actions ARE audit-logged in the
+  pack since v0.5.7 — the same one-line JSON records, in the function
+  log.
+
 ## Capacity & limits (measured, v0.5.6)
 
 First published load figures, from `scripts/load-bench.mjs` — a repeatable
@@ -255,10 +306,10 @@ single-file ceiling is documented future work, not a flag you can flip.
 `deploy/netlify/` contains a Netlify Function implementing the same multi-workspace semantics over Netlify Blobs (strong consistency):
 
 1. Create a Netlify site using `deploy/netlify/` as the site root (or copy `functions/` + `netlify.toml` into a site).
-2. Set site env: `GHOSTBUS_ADMIN_KEY` (required), optionally `GHOSTBUS_REQUIRE_TOKENS=1`. (The serverless pack keeps token enforcement opt-in via this env; the Node hosted server above enforces by default since v0.5.2.)
+2. Set site env: `GHOSTBUS_ADMIN_KEY` (required, at least 16 characters — the pack refuses to construct without one, same floor as the Node server). Per-agent token enforcement is ON by default here too (since v0.5.7, matching the Node hosted server); `GHOSTBUS_REQUIRE_TOKENS=0` is the only opt-out.
 3. Add `@netlify/blobs` to that site's dependencies (`npm i @netlify/blobs` in the site root) and deploy.
 
-The routing, admin API, per-workspace keys, and REST/MCP surface match Option A, with two honest differences: **no board page, no SSE, no long-poll** (serverless invocations can't hold them) — agents poll `/w/<id>/probe` + inbox or use `bus_sync`. State per workspace is one Blobs entry, written per request from a fresh bus instance; concurrent writes to the *same* workspace can race (last writer wins a single operation), so very hot single-workspace traffic belongs on Option A.
+The routing, admin API (create / list / delete / **rotate-key / export / import** — parity since v0.5.7), per-workspace keys, and REST/MCP surface match Option A, with two honest differences: **no board page, no SSE, no long-poll** (serverless invocations can't hold them) — agents poll `/w/<id>/probe` + inbox or use `bus_sync`. Two smaller divergences are documented in the Round 6 notes above (no app-level failed-auth throttle; platform-bounded request bodies). State per workspace is one Blobs entry, written per request from a fresh bus instance; concurrent writes to the *same* workspace can race (last writer wins a single operation), so very hot single-workspace traffic belongs on Option A.
 
 The serverless logic (`deploy/netlify/functions/lib.mjs`) is unit-tested with an in-memory KV through real Web Request/Response objects: `node deploy/netlify/test-lib.mjs`.
 

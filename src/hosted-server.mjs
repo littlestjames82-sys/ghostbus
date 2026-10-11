@@ -31,6 +31,11 @@
  *   route matching (regex), workspace resolution, and the registry itself
  *   when loaded: ids become file names inside the data dir, so a planted or
  *   hand-edited registry entry must never turn one into a path outside it.
+ * - v0.5.7: the credential lifecycle was audited end to end (rotation is
+ *   immediate and is now reachable over plain REST for agent tokens, not
+ *   just MCP) and the serverless pack was realigned with this server —
+ *   enforcement default, admin-key floor, rotate/export/import. See
+ *   SECURITY.md ("Credential lifecycle") and docs/hosted.md round 6.
  */
 import http from 'node:http';
 import fs from 'node:fs';

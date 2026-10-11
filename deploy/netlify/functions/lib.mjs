@@ -12,9 +12,18 @@
  * can race (last writer wins one operation); that's stated in docs/hosted.md,
  * not hidden. SSE and long-poll are NOT available serverless — agents poll
  * /probe + inbox, or use bus_sync.
+ *
+ * Parity (v0.5.7): this pack previously drifted from the Node hosted
+ * server — per-agent token enforcement defaulted OFF here (the Node
+ * server enforces by default since v0.5.2), the admin key had no minimum
+ * length, and workspace key rotation / export / import did not exist, so
+ * a leaked serverless workspace key could only be answered by deleting
+ * the workspace. All four are aligned now; the remaining divergences
+ * (no app-level failed-auth throttle, platform-bounded request bodies)
+ * are documented in docs/hosted.md, not silent.
  */
 import crypto from 'node:crypto';
-import { GhostBus, GHOSTBUS_VERSION } from '../../../src/core.mjs';
+import { GhostBus, GHOSTBUS_VERSION, validateSnapshot } from '../../../src/core.mjs';
 import { TOOLS, callTool } from '../../../src/tools.mjs';
 
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
@@ -26,8 +35,11 @@ class KVStore {
   async save(state) { await this.kv.set(this.key, JSON.stringify(state)); }
 }
 
-export function createHostedCore({ kv, adminKey, requireTokens = false }) {
+export function createHostedCore({ kv, adminKey, requireTokens = true }) {
   if (!adminKey) throw new Error('adminKey required');
+  // Same floor as the Node hosted server (v0.5.2): the admin key is the
+  // operator root key; a short one must fail loudly at startup, not serve.
+  if (adminKey.length < 16) throw new Error('adminKey too short: use at least 16 characters (32+ random hex recommended)');
   const regKey = 'registry';
   const loadReg = async () => { const t = await kv.get(regKey); return t ? JSON.parse(t) : { workspaces: {} }; };
   const saveReg = async (r) => kv.set(regKey, JSON.stringify(r));
@@ -40,6 +52,13 @@ export function createHostedCore({ kv, adminKey, requireTokens = false }) {
   const isAdmin = (req) => { const g = keyOf(req); if (!g) return false; const a = Buffer.from(sha256(g)), b = Buffer.from(sha256(adminKey)); return a.length === b.length && crypto.timingSafeEqual(a, b); };
   const hashOk = (given, storedHashHex) => { const a = Buffer.from(sha256(given)), b = Buffer.from(String(storedHashHex)); return a.length === b.length && crypto.timingSafeEqual(a, b); };
   const wsKeyOk = (req, meta) => { const g = keyOf(req); if (!g) return false; return hashOk(g, meta.keyHash) || isAdmin(req); };
+  // Operator audit trail (v0.5.7, parity with the Node hosted server's
+  // v0.5.3 log): one structured line per admin action to the function log —
+  // timestamp, action, workspace id, source IP. NEVER a key or a hash.
+  const audit = (action, id, req) => {
+    const ip = req.headers.get('x-nf-client-connection-ip') || 'unknown';
+    console.error(JSON.stringify({ ts: new Date().toISOString(), audit: 'admin', action, workspace: id, ip }));
+  };
 
   return async function handle(req) {
     const url = new URL(req.url);
@@ -53,6 +72,48 @@ export function createHostedCore({ kv, adminKey, requireTokens = false }) {
       if (parts[0] === 'api' && parts[1] === 'workspaces') {
         if (!isAdmin(req)) return json(401, { error: 'admin key required' });
         const reg = await loadReg();
+        if (req.method === 'POST' && parts[2] === 'import') {
+          const body = await req.json().catch(() => null);
+          if (!body) return json(400, { error: 'invalid JSON body' });
+          // Same envelope rules as the Node server: a full export, a bare
+          // {state}, or a raw state — deeply validated before it lands.
+          const env = body.ghostbusExport ? body : null;
+          const state = env ? env.state : (body.state || body);
+          const bad = validateSnapshot(state);
+          if (bad) return json(400, { error: `invalid snapshot: ${bad}` });
+          const id = body.id || (env && env.workspace && env.workspace.id) || state.workspace.id || `ws-${crypto.randomBytes(4).toString('hex')}`;
+          if (!/^[a-z0-9][a-z0-9-]{1,62}$/.test(id)) return json(400, { error: 'workspace id: lowercase letters, digits, - (2-63 chars)' });
+          if (reg.workspaces[id]) return json(409, { error: `workspace already exists: ${id} (delete it first, or import under a new id)` });
+          const name = String(body.name || (env && env.workspace && env.workspace.name) || state.workspace.name || id).slice(0, 120);
+          const key = crypto.randomBytes(24).toString('hex');
+          reg.workspaces[id] = { name, keyHash: sha256(key), createdAt: new Date().toISOString(), importedAt: new Date().toISOString() };
+          await kv.set(`state:${id}`, JSON.stringify(state));
+          await saveReg(reg);
+          audit('import', id, req);
+          const s = await (await busFor(id, reg.workspaces[id])).status();
+          return json(201, { id, name, key, keyNote: 'Workspace key — shown ONCE, only its hash is stored. Imported workspaces always get a FRESH key; the source key is not carried over.', agents: s.agents, messages: s.messages, tasks: s.tasks.total });
+        }
+        if (req.method === 'POST' && parts[2] && parts[3] === 'rotate-key') {
+          const id = parts[2];
+          if (!reg.workspaces[id]) return json(404, { error: `no such workspace: ${id}` });
+          const key = crypto.randomBytes(24).toString('hex');
+          reg.workspaces[id].keyHash = sha256(key);
+          reg.workspaces[id].keyRotatedAt = new Date().toISOString();
+          await saveReg(reg);
+          audit('rotate-key', id, req);
+          // Stateless per request: the registry write above IS the whole
+          // change — the old key fails the very next request, no cache to
+          // refresh (the Node server additionally refreshes its cached meta).
+          return json(200, { id, key, keyNote: 'New workspace key — shown ONCE. The previous key is invalid from this moment.', keyRotatedAt: reg.workspaces[id].keyRotatedAt });
+        }
+        if (req.method === 'GET' && parts[2] && parts[3] === 'export') {
+          const id = parts[2];
+          const meta = reg.workspaces[id];
+          if (!meta) return json(404, { error: `no such workspace: ${id}` });
+          const state = await (await busFor(id, meta)).snapshot();
+          audit('export', id, req);
+          return json(200, { ghostbusExport: 1, version: GHOSTBUS_VERSION, exportedAt: new Date().toISOString(), workspace: { id, name: meta.name }, state });
+        }
         if (req.method === 'POST') {
           const body = await req.json().catch(() => null);
           if (!body) return json(400, { error: 'invalid JSON body' });
@@ -62,6 +123,7 @@ export function createHostedCore({ kv, adminKey, requireTokens = false }) {
           const key = crypto.randomBytes(24).toString('hex');
           reg.workspaces[id] = { name: String(body.name || id).slice(0, 120), keyHash: sha256(key), createdAt: new Date().toISOString() };
           await saveReg(reg);
+          audit('create', id, req);
           return json(201, { id, name: reg.workspaces[id].name, key, keyNote: 'Shown ONCE — only its hash is stored.' });
         }
         if (req.method === 'GET') {
@@ -78,6 +140,7 @@ export function createHostedCore({ kv, adminKey, requireTokens = false }) {
           delete reg.workspaces[id];
           await saveReg(reg);
           await kv.delete(`state:${id}`);
+          audit('delete', id, req);
           return json(200, { id, deleted: true });
         }
       }
@@ -120,6 +183,7 @@ export function createHostedCore({ kv, adminKey, requireTokens = false }) {
         if (req.method === 'GET' && R('/api/status')) return json(200, await bus.status());
         if (req.method === 'GET' && R('/api/agents')) return json(200, { agents: await bus.listAgents() });
         if (req.method === 'POST' && R('/api/agents')) return json(200, await bus.registerAgent({ name: body.agent, role: body.role, capabilities: body.capabilities, token: tk }));
+        if (req.method === 'POST' && R('/api/agents/rotate-token')) return json(200, await bus.rotateAgentToken({ name: body.agent, token: tk }));
         if (req.method === 'POST' && R('/api/messages')) return json(200, await bus.sendMessage({ from: body.agent, to: body.to ?? '*', body: body.body, channel: body.channel ?? 'general', threadId: body.threadId ?? null, token: tk }));
         if (req.method === 'GET' && R('/api/inbox')) return json(200, { messages: await bus.inbox(q.agent, { unreadOnly: q.unread === '1', limit: Number(q.limit || 50), token: tk }) });
         if (req.method === 'POST' && R('/api/heartbeat')) return json(200, await bus.heartbeat({ name: body.agent, token: tk }));

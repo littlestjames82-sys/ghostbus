@@ -19,7 +19,10 @@ const kv = {
 const handle = createHostedCore({
   kv,
   adminKey: process.env.GHOSTBUS_ADMIN_KEY || '',
-  requireTokens: process.env.GHOSTBUS_REQUIRE_TOKENS === '1',
+  // Enforcement is the default here too (v0.5.7 — the Node hosted server
+  // has enforced by default since v0.5.2; this pack silently opted out).
+  // GHOSTBUS_REQUIRE_TOKENS=0 is the only opt-out, same as Node.
+  requireTokens: process.env.GHOSTBUS_REQUIRE_TOKENS !== '0',
 });
 
 export default async (req) => handle(req);

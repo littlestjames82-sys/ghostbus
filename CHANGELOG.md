@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.2 — 2026-10-11
+
+Security hardening — the pre-pilot pass. A cold source review scored GhostBus 7.4/10 with security maturity its lowest mark (5.5/10, "authentication enforcement and deployment hardening need attention"). That was the right call to answer before any hosted workspace carries a stranger's work — or their money:
+
+- **Hosted: per-agent token enforcement is now the DEFAULT** (`src/hosted-server.mjs`) — every workspace bus is created with enforcement on, no env var needed. The only opt-out is an explicit `GHOSTBUS_REQUIRE_TOKENS=0`, and using it prints a loud three-line stderr warning at startup (with enforcement off, anyone holding a workspace key can act under any agent name). Header comment updated to match.
+- **Hosted: admin-key floor** — the hosted server already refused to start without `GHOSTBUS_ADMIN_KEY`; it now also refuses keys shorter than 16 characters (exit 2). The admin key is operator root (creates/deletes workspaces, master key inside all of them) and gets a floor to match. Storage/rotation guidance (root-only file, chmod 600, rotate by restart) is documented in `docs/hosted.md`.
+- **Single relay: exposure is never silent** (`src/http-server.mjs`) — Node's `listen()` binds all network interfaces, not just loopback. Starting the relay without `GHOSTBUS_KEY` now prints a loud warning saying exactly that; with a key but token enforcement off, a one-line warning names the impersonation trade-off. Semantics unchanged: local trust is still the relay's default model.
+- **Docs** — new "Security & deployment hardening" section in `docs/hosted.md`: enforcement default + opt-out, HTTPS REQUIRED for any public deployment (reverse proxy or a *named* Cloudflare Tunnel; a quick tunnel is explicitly not for paid use), admin-key storage/rotation, per-workspace key handling, scheduled export backups. README hosted section points at it.
+- **Tests** — the two existing hosted checks now present the tokens issued at registration (they exercise the enforced path, as real clients now must), and four new checks cover the pass: default-on enforcement over real HTTP (no token → 400, wrong token → 400, issued token → 200, header and body forms), the `=0` opt-out + its startup warning, the short-admin-key refusal, and the relay's no-key warning. All four fail against the 0.5.1 servers (47 passed, 4 failed) and pass with the change.
+- **Scope boundary, honestly** — what did NOT change: core bus behavior, the local stdio/CLI trust model (tokens stay opt-in there via `GHOSTBUS_REQUIRE_TOKENS=1`), the single relay's opt-in posture beyond the new warnings, storage (memory/JSON file; a networked multi-writer store is still future work, not faked here), and the serverless pack (its `GHOSTBUS_REQUIRE_TOKENS` env remains opt-in). The hosted `open` surfaces — board page, `/health`, `/probe` — were audited, not changed: every workspace is always created with a key and no data route bypasses it; the three open paths serve the static board shell, liveness, and counts-only probe data, the same posture as the single relay, and are documented as such.
+- 51 checks in the main suite (was 47) + 6 serverless, all passing; both demos green.
+
 ## 0.5.1 — 2026-10-09
 
 Reliability fix — the operation-level race above the v0.4.1 FileStore fix:

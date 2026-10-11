@@ -23,8 +23,9 @@ const storePath = argVal('--store') || process.env.GHOSTBUS_STORE || './ghostbus
 const wsName = argVal('--name') || process.env.GHOSTBUS_WORKSPACE_NAME || 'GhostBus Workspace';
 const KEY = process.env.GHOSTBUS_KEY || '';
 
+const REQUIRE_TOKENS = process.env.GHOSTBUS_REQUIRE_TOKENS === '1';
 const store = storePath === ':memory:' ? new MemoryStore() : new FileStore(storePath);
-const bus = await createBus(store, { name: wsName }, { requireTokens: process.env.GHOSTBUS_REQUIRE_TOKENS === '1' });
+const bus = await createBus(store, { name: wsName }, { requireTokens: REQUIRE_TOKENS });
 const handle = createBusHandler({ id: 'default', bus, key: KEY });
 
 const server = http.createServer((req, res) => {
@@ -33,4 +34,14 @@ const server = http.createServer((req, res) => {
 });
 server.listen(port, () => {
   process.stderr.write(`ghostbus http relay v${GHOSTBUS_VERSION} · http://127.0.0.1:${port} · store=${storePath} · auth=${KEY ? 'workspace key required' : 'open (set GHOSTBUS_KEY)'}\n`);
+  // Node's listen() with no host binds ALL network interfaces, not just
+  // loopback — the 127.0.0.1 above is the local URL, not a bind restriction.
+  // Local trust is the relay's default model and stays unchanged, but an
+  // unkeyed or tokenless relay must never be network-reachable *silently*.
+  if (!KEY) {
+    process.stderr.write('WARNING: GHOSTBUS_KEY is not set — this relay is OPEN: anyone who can reach this port can read and write the workspace.\n');
+    process.stderr.write('WARNING: the relay listens on all network interfaces, not just localhost. Set GHOSTBUS_KEY (a long secret) before exposing it beyond this machine, or firewall the port.\n');
+  } else if (!REQUIRE_TOKENS) {
+    process.stderr.write('WARNING: per-agent tokens are not enforced (GHOSTBUS_REQUIRE_TOKENS is not 1): anyone holding the workspace key can act under any agent name. The relay listens on all network interfaces — set GHOSTBUS_REQUIRE_TOKENS=1 if untrusted agents share the key.\n');
+  }
 });

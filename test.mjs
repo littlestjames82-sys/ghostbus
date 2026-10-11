@@ -522,9 +522,12 @@ await check('hosted: admin-gated creation, per-workspace keys, full isolation, M
     assert.equal((await fetch('http://127.0.0.1:18382/w/alpha/api/status')).status, 401);
     // admin key works as master inside a workspace
     assert.equal((await fetch('http://127.0.0.1:18382/w/alpha/api/status', { headers: A })).status, 200);
-    // work in alpha only
-    await fetch('http://127.0.0.1:18382/w/alpha/api/agents', { method: 'POST', headers: KA, body: JSON.stringify({ agent: 'alpha-agent', role: 'a' }) });
-    await fetch('http://127.0.0.1:18382/w/alpha/api/tasks', { method: 'POST', headers: KA, body: JSON.stringify({ agent: 'alpha-agent', title: 'Alpha-only task' }) });
+    // work in alpha only (v0.5.2: hosted enforces per-agent tokens by
+    // default, so the acting agent presents the token issued at register)
+    const alphaReg = await J(await fetch('http://127.0.0.1:18382/w/alpha/api/agents', { method: 'POST', headers: KA, body: JSON.stringify({ agent: 'alpha-agent', role: 'a' }) }));
+    assert.ok(alphaReg.token, 'registration must return the agent token');
+    const KAT = { ...KA, 'x-agent-token': alphaReg.token };
+    await fetch('http://127.0.0.1:18382/w/alpha/api/tasks', { method: 'POST', headers: KAT, body: JSON.stringify({ agent: 'alpha-agent', title: 'Alpha-only task' }) });
     const betaAgents = await J(await fetch('http://127.0.0.1:18382/w/beta/api/agents', { headers: KB }));
     assert.equal(betaAgents.agents.length, 0); // isolation: beta sees none of alpha's agents
     const betaTasks = await J(await fetch('http://127.0.0.1:18382/w/beta/api/tasks', { headers: KB }));
@@ -554,16 +557,17 @@ await check('hosted: admin-gated creation, per-workspace keys, full isolation, M
 
 await check('hosted operator: rotate-key kills the old key; export -> delete -> import restores with a fresh key', async () => {
   const dataDir = path.join(tmp, 'hosted-ops');
-  const env = { ...process.env, GHOSTBUS_ADMIN_KEY: 'ops-admin-456' };
+  const env = { ...process.env, GHOSTBUS_ADMIN_KEY: 'ops-admin-secret-456' };
   const proc = spawn('node', ['src/hosted-server.mjs', '--port', '18383', '--data-dir', dataDir], { cwd: new URL('.', import.meta.url).pathname, env, stdio: ['ignore', 'pipe', 'pipe'] });
-  const A = { 'content-type': 'application/json', 'x-bus-key': 'ops-admin-456' };
+  const A = { 'content-type': 'application/json', 'x-bus-key': 'ops-admin-secret-456' };
   const J = (r) => r.json();
   try {
     for (let i = 0; i < 50; i++) { try { const r = await fetch('http://127.0.0.1:18383/health'); if (r.ok) break; } catch {} await new Promise(r => setTimeout(r, 100)); }
     const c = await J(await fetch('http://127.0.0.1:18383/api/workspaces', { method: 'POST', headers: A, body: JSON.stringify({ id: 'ops', name: 'Ops Team' }) }));
     const K1 = { 'content-type': 'application/json', 'x-bus-key': c.key };
-    await fetch('http://127.0.0.1:18383/w/ops/api/agents', { method: 'POST', headers: K1, body: JSON.stringify({ agent: 'ops-agent', role: 'o' }) });
-    await fetch('http://127.0.0.1:18383/w/ops/api/tasks', { method: 'POST', headers: K1, body: JSON.stringify({ agent: 'ops-agent', title: 'Ops task' }) });
+    const opsReg = await J(await fetch('http://127.0.0.1:18383/w/ops/api/agents', { method: 'POST', headers: K1, body: JSON.stringify({ agent: 'ops-agent', role: 'o' }) }));
+    const K1T = { ...K1, 'x-agent-token': opsReg.token };
+    await fetch('http://127.0.0.1:18383/w/ops/api/tasks', { method: 'POST', headers: K1T, body: JSON.stringify({ agent: 'ops-agent', title: 'Ops task' }) });
     // rotate: admin-only, old key dies immediately, new key works
     assert.equal((await fetch('http://127.0.0.1:18383/api/workspaces/ops/rotate-key', { method: 'POST', headers: K1, body: '{}' })).status, 401);
     const rot = await J(await fetch('http://127.0.0.1:18383/api/workspaces/ops/rotate-key', { method: 'POST', headers: A, body: '{}' }));
@@ -588,6 +592,88 @@ await check('hosted operator: rotate-key kills the old key; export -> delete -> 
     // importing over an existing id is refused; garbage snapshots refused
     assert.equal((await fetch('http://127.0.0.1:18383/api/workspaces/import', { method: 'POST', headers: A, body: JSON.stringify(exp) })).status, 409);
     assert.equal((await fetch('http://127.0.0.1:18383/api/workspaces/import', { method: 'POST', headers: A, body: JSON.stringify({ id: 'junk', state: { nope: 1 } }) })).status, 400);
+  } finally { proc.kill(); }
+});
+
+await check('hosted security (v0.5.2): per-agent tokens enforced BY DEFAULT — no env set; tokenless action rejected, issued token works', async () => {
+  const dataDir = path.join(tmp, 'hosted-secure');
+  const env = { ...process.env, GHOSTBUS_ADMIN_KEY: 'default-on-admin-789' };
+  delete env.GHOSTBUS_REQUIRE_TOKENS; // the whole point: enforcement must not need the opt-in anymore
+  const proc = spawn('node', ['src/hosted-server.mjs', '--port', '18384', '--data-dir', dataDir], { cwd: new URL('.', import.meta.url).pathname, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const A = { 'content-type': 'application/json', 'x-bus-key': 'default-on-admin-789' };
+  const J = (r) => r.json();
+  try {
+    for (let i = 0; i < 50; i++) { try { const r = await fetch('http://127.0.0.1:18384/health'); if (r.ok) break; } catch {} await new Promise(r => setTimeout(r, 100)); }
+    // admin routes refuse a missing admin key (list as well as create)
+    assert.equal((await fetch('http://127.0.0.1:18384/api/workspaces')).status, 401);
+    const c = await J(await fetch('http://127.0.0.1:18384/api/workspaces', { method: 'POST', headers: A, body: JSON.stringify({ id: 'secure', name: 'Secure Team' }) }));
+    const K = { 'content-type': 'application/json', 'x-bus-key': c.key };
+    const reg = await J(await fetch('http://127.0.0.1:18384/w/secure/api/agents', { method: 'POST', headers: K, body: JSON.stringify({ agent: 'sec-agent', role: 's' }) }));
+    assert.ok(reg.token, 'registration issues the agent token');
+    // acting with NO per-agent token is rejected under the default
+    const noTok = await fetch('http://127.0.0.1:18384/w/secure/api/messages', { method: 'POST', headers: K, body: JSON.stringify({ agent: 'sec-agent', to: '*', body: 'tokenless' }) });
+    assert.equal(noTok.status, 400);
+    assert.match((await J(noTok)).error, /token required or wrong/);
+    // a WRONG token is rejected too
+    const badTok = await fetch('http://127.0.0.1:18384/w/secure/api/messages', { method: 'POST', headers: { ...K, 'x-agent-token': 'deadbeefdeadbeef' }, body: JSON.stringify({ agent: 'sec-agent', to: '*', body: 'wrong token' }) });
+    assert.equal(badTok.status, 400);
+    // the ISSUED token works, as header and as body field
+    const okMsg = await fetch('http://127.0.0.1:18384/w/secure/api/messages', { method: 'POST', headers: { ...K, 'x-agent-token': reg.token }, body: JSON.stringify({ agent: 'sec-agent', to: '*', body: 'with token' }) });
+    assert.equal(okMsg.status, 200);
+    const okTask = await fetch('http://127.0.0.1:18384/w/secure/api/tasks', { method: 'POST', headers: K, body: JSON.stringify({ agent: 'sec-agent', title: 'Token task', token: reg.token }) });
+    assert.equal(okTask.status, 200);
+  } finally { proc.kill(); }
+});
+
+await check('hosted security (v0.5.2): GHOSTBUS_REQUIRE_TOKENS=0 is the only opt-out — and it starts with a loud warning', async () => {
+  const dataDir = path.join(tmp, 'hosted-optout');
+  const env = { ...process.env, GHOSTBUS_ADMIN_KEY: 'optout-admin-0000', GHOSTBUS_REQUIRE_TOKENS: '0' };
+  const proc = spawn('node', ['src/hosted-server.mjs', '--port', '18385', '--data-dir', dataDir], { cwd: new URL('.', import.meta.url).pathname, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  let err = '';
+  proc.stderr.on('data', d => { err += d; });
+  const A = { 'content-type': 'application/json', 'x-bus-key': 'optout-admin-0000' };
+  const J = (r) => r.json();
+  try {
+    for (let i = 0; i < 50; i++) { try { const r = await fetch('http://127.0.0.1:18385/health'); if (r.ok) break; } catch {} await new Promise(r => setTimeout(r, 100)); }
+    assert.match(err, /WARNING/);
+    assert.match(err, /GHOSTBUS_REQUIRE_TOKENS=0/);
+    const c = await J(await fetch('http://127.0.0.1:18385/api/workspaces', { method: 'POST', headers: A, body: JSON.stringify({ id: 'open-ws', name: 'Opted Out' }) }));
+    const K = { 'content-type': 'application/json', 'x-bus-key': c.key };
+    await fetch('http://127.0.0.1:18385/w/open-ws/api/agents', { method: 'POST', headers: K, body: JSON.stringify({ agent: 'free-agent' }) });
+    const msg = await fetch('http://127.0.0.1:18385/w/open-ws/api/messages', { method: 'POST', headers: K, body: JSON.stringify({ agent: 'free-agent', to: '*', body: 'no token needed here' }) });
+    assert.equal(msg.status, 200); // enforcement really is off
+  } finally { proc.kill(); }
+});
+
+await check('hosted security (v0.5.2): a short admin key is refused at startup', async () => {
+  const dataDir = path.join(tmp, 'hosted-shortkey');
+  const env = { ...process.env, GHOSTBUS_ADMIN_KEY: 'short' };
+  const proc = spawn('node', ['src/hosted-server.mjs', '--port', '18386', '--data-dir', dataDir], { cwd: new URL('.', import.meta.url).pathname, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  let err = '';
+  proc.stderr.on('data', d => { err += d; });
+  try {
+    const code = await new Promise((resolve) => {
+      const t = setTimeout(() => resolve(null), 3000);
+      proc.on('exit', (c) => { clearTimeout(t); resolve(c); });
+    });
+    assert.notEqual(code, null, 'server with a 5-char admin key must exit, not start');
+    assert.equal(code, 2);
+    assert.match(err, /at least 16 characters/);
+  } finally { proc.kill(); }
+});
+
+await check('http relay (v0.5.2): no GHOSTBUS_KEY -> loud warning that it listens on all network interfaces', async () => {
+  const storeFile = path.join(tmp, 'relay-warn.json');
+  const env = { ...process.env };
+  delete env.GHOSTBUS_KEY;
+  const proc = spawn('node', ['src/http-server.mjs', '--port', '18387', '--store', storeFile], { cwd: new URL('.', import.meta.url).pathname, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  let err = '';
+  proc.stderr.on('data', d => { err += d; });
+  try {
+    for (let i = 0; i < 50; i++) { try { const r = await fetch('http://127.0.0.1:18387/health'); if (r.ok) break; } catch {} await new Promise(r => setTimeout(r, 100)); }
+    assert.match(err, /WARNING/);
+    assert.match(err, /all network interfaces/);
+    assert.match(err, /GHOSTBUS_KEY/);
   } finally { proc.kill(); }
 });
 

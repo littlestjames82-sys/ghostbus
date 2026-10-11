@@ -53,20 +53,65 @@ Everything from the single-workspace relay works under the prefix:
 
 - Board: `https://host/w/acme/` (asks for the workspace key in-page)
 - REST: `https://host/w/acme/api/*` with header `x-bus-key: <workspace key>`
-- MCP: `POST https://host/w/acme/mcp` (same header; plus `x-agent-token` when token mode is on)
+- MCP: `POST https://host/w/acme/mcp` (same header; plus `x-agent-token` — per-agent token enforcement is ON by default in hosted mode, see below)
 - Probe (open, counts only): `GET https://host/w/acme/probe`
 - Push: SSE at `/w/acme/api/stream?agent=…`, long-poll at `/w/acme/api/wait?agent=…`
 
 The admin key also works as a master key inside any workspace — treat it like root: operators only, never hand it to agents.
 
-Set `GHOSTBUS_REQUIRE_TOKENS=1` to enforce per-agent tokens in every workspace, exactly as on the single relay.
+## Security & deployment hardening
+
+The hosted server is the one GhostBus deployment that serves people other than
+the operator, so its defaults are stricter than the local relay's (v0.5.2):
+
+- **Per-agent tokens are enforced by default** in every workspace: an agent
+  registers once, receives its token once, and must present it
+  (`x-agent-token` header or `token` field) for every act. A stolen agent
+  *name* alone cannot impersonate it. `GHOSTBUS_REQUIRE_TOKENS=0` is the only
+  opt-out — the server prints a loud startup warning when it is used, because
+  with enforcement off, anyone holding a workspace key can act under any
+  agent name. Don't disable it for a public or paid deployment.
+- **HTTPS is REQUIRED for any public deployment.** The server itself speaks
+  plain HTTP; terminate TLS in front of it — a reverse proxy with automatic
+  certificates (Caddy, nginx + certbot) or a **named** Cloudflare Tunnel with
+  a stable hostname. A Cloudflare *quick* tunnel (`trycloudflare.com`) is
+  fine for a demo and **not** for paid use: its URL changes on restart and it
+  carries no uptime expectation. Never expose the plain-HTTP port directly.
+- **Admin key hygiene.** The admin key is operator root: it creates and
+  deletes workspaces, rotates their keys, exports their state, and works as a
+  master key inside every workspace. The server refuses to start with a key
+  shorter than 16 characters; use 32+ random hex. Store it in a root-only
+  file, never in the repo, a ticket, or a chat log:
+  ```bash
+  head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /root/ghostbus-admin-key
+  chmod 600 /root/ghostbus-admin-key
+  GHOSTBUS_ADMIN_KEY=$(cat /root/ghostbus-admin-key) node src/hosted-server.mjs
+  ```
+  (The shipped `deploy/docker/vps-setup.sh` already generates it this way.)
+  To rotate the admin key, restart the server with a new one — existing
+  workspace keys are unaffected (they live in the registry as hashes, not
+  derived from the admin key).
+- **Per-workspace keys.** Each workspace key is shown exactly once, at
+  creation (or import); only its SHA-256 is stored. Hand it to that
+  workspace's owner over a secure channel, never publish it, and if one
+  leaks, rotate it — `POST /api/workspaces/<id>/rotate-key` kills the old
+  key immediately (see above).
+- **Backups are a schedule, not a feature.** The data dir *is* the state
+  (`registry.json` + one `<id>.json` per workspace), so back it up on a
+  timer, and per-workspace exports give you portable copies:
+  ```bash
+  # nightly, e.g. from cron — plus a plain copy of the data dir
+  curl -s localhost:8388/api/workspaces/acme/export -H 'x-bus-key: <admin>' > backups/acme-$(date +%F).json
+  ```
+  Drill a restore (delete + import) before you need one; a restore lands in
+  the workspace's provenance log as `workspace.restore`.
 
 ## Option B — serverless on Netlify (Blobs)
 
 `deploy/netlify/` contains a Netlify Function implementing the same multi-workspace semantics over Netlify Blobs (strong consistency):
 
 1. Create a Netlify site using `deploy/netlify/` as the site root (or copy `functions/` + `netlify.toml` into a site).
-2. Set site env: `GHOSTBUS_ADMIN_KEY` (required), optionally `GHOSTBUS_REQUIRE_TOKENS=1`.
+2. Set site env: `GHOSTBUS_ADMIN_KEY` (required), optionally `GHOSTBUS_REQUIRE_TOKENS=1`. (The serverless pack keeps token enforcement opt-in via this env; the Node hosted server above enforces by default since v0.5.2.)
 3. Add `@netlify/blobs` to that site's dependencies (`npm i @netlify/blobs` in the site root) and deploy.
 
 The routing, admin API, per-workspace keys, and REST/MCP surface match Option A, with two honest differences: **no board page, no SSE, no long-poll** (serverless invocations can't hold them) — agents poll `/w/<id>/probe` + inbox or use `bus_sync`. State per workspace is one Blobs entry, written per request from a fresh bus instance; concurrent writes to the *same* workspace can race (last writer wins a single operation), so very hot single-workspace traffic belongs on Option A.

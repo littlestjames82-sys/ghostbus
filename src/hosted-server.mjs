@@ -18,7 +18,11 @@
  *     GET    /api/workspaces/<id>/export   -> full-state export envelope (backup/migrate)
  *     POST   /api/workspaces/import {id?, name?, state|export} -> {id, name, key (once)}
  * - Registry + one data file per workspace live in the data dir.
- *   Set GHOSTBUS_REQUIRE_TOKENS=1 to enforce per-agent tokens in all workspaces.
+ * - Per-agent tokens are ENFORCED in all workspaces by default (v0.5.2):
+ *   hosted mode serves strangers, so a stolen agent name must not be enough
+ *   to act. GHOSTBUS_REQUIRE_TOKENS=0 is the only opt-out and starts with a
+ *   loud warning. GHOSTBUS_ADMIN_KEY is required and must be at least 16
+ *   characters — it is the operator root key (see docs/hosted.md).
  */
 import http from 'node:http';
 import fs from 'node:fs';
@@ -32,11 +36,24 @@ const argVal = (flag) => { const i = argv.indexOf(flag); return i >= 0 ? argv[i 
 const port = Number(argVal('--port') || process.env.GHOSTBUS_PORT || 8388);
 const dataDir = argVal('--data-dir') || process.env.GHOSTBUS_DATA_DIR || './ghostbus-hosted';
 const ADMIN_KEY = process.env.GHOSTBUS_ADMIN_KEY || '';
-const REQUIRE_TOKENS = process.env.GHOSTBUS_REQUIRE_TOKENS === '1';
+// v0.5.2: enforcement is the hosted DEFAULT. Only an explicit
+// GHOSTBUS_REQUIRE_TOKENS=0 turns it off (anything else, including unset,
+// means on) — the hosted server is the one deployment that serves people
+// other than the operator, so the safe posture cannot be opt-in.
+const REQUIRE_TOKENS = process.env.GHOSTBUS_REQUIRE_TOKENS !== '0';
 
 if (!ADMIN_KEY) {
   process.stderr.write('GHOSTBUS_ADMIN_KEY is required for the hosted server (workspace creation must not be open).\n');
   process.exit(2);
+}
+if (ADMIN_KEY.length < 16) {
+  process.stderr.write('GHOSTBUS_ADMIN_KEY is too short: use at least 16 characters (32+ random hex recommended). The admin key is the operator root key — it creates/deletes workspaces and acts as a master key inside every one of them.\n');
+  process.exit(2);
+}
+if (!REQUIRE_TOKENS) {
+  process.stderr.write('WARNING: GHOSTBUS_REQUIRE_TOKENS=0 — per-agent token enforcement is DISABLED in every workspace.\n');
+  process.stderr.write('WARNING: anyone holding a workspace key can act under ANY agent name in that workspace (impersonation).\n');
+  process.stderr.write('WARNING: hosted mode serves strangers; run with enforcement on unless you have a specific reason not to.\n');
 }
 
 fs.mkdirSync(dataDir, { recursive: true });

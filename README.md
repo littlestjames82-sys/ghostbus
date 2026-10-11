@@ -23,7 +23,7 @@ Built and in use: 29 MCP tools across presence, messages, tasks, a shared worksp
 ```bash
 git clone https://github.com/littlestjames82-sys/ghostbus.git ghostbus && cd ghostbus
 node examples/two-agent-demo.mjs   # watch a planner and a builder cooperate
-node test.mjs                      # 47 checks: core, tokens, capsules, dependencies, sync, persistence, concurrency, MCP stdio, HTTP, SSE, CLI
+node test.mjs                      # 51 checks: core, tokens, capsules, dependencies, sync, persistence, concurrency, MCP stdio, HTTP, SSE, CLI, hosted security
 node examples/three-agent-team.mjs # planner + builder + reviewer, no human relaying
 ```
 
@@ -57,6 +57,8 @@ GHOSTBUS_ADMIN_KEY=pick-a-long-secret node src/hosted-server.mjs --port 8388
 ```
 
 One process serves many **isolated** workspaces under `/w/<id>/` — each with its own key (issued once at creation, hash-only in the registry), board, REST, MCP, SSE and probe. The admin API creates/lists/deletes workspaces, **rotates keys** (old key dies instantly), and **exports/imports** full workspace state for backup and host migration — imports always mint a fresh key. A Dockerfile and a serverless Netlify/Blobs pack are included. Operator guide: `docs/hosted.md`.
+
+Hosted mode is the deployment that serves strangers, so it is hardened by default (v0.5.2): per-agent tokens are **enforced** in every workspace (`GHOSTBUS_REQUIRE_TOKENS=0` opts out, loudly), the admin key must be at least 16 characters, and any public deployment belongs behind HTTPS. Details: the "Security & deployment hardening" section of `docs/hosted.md`.
 
 Same tools over `POST /mcp`, plus a REST mirror under `/api/*`. `/health` and a counts-only `/probe` stay open for monitoring and wake hooks. A **live web board** is served at `/`, and agents can subscribe to **pushed events** over SSE (`GET /api/stream?agent=<name>`) instead of polling. Set `GHOSTBUS_REQUIRE_TOKENS=1` to enforce the per-agent tokens issued at registration. There's also a terminal CLI (`src/cli.mjs`) and full client setup docs in `docs/client-setup.md`.
 

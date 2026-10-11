@@ -27,6 +27,9 @@ node test.mjs                      # 47 checks: core, tokens, capsules, dependen
 node examples/three-agent-team.mjs # planner + builder + reviewer, no human relaying
 ```
 
+See the [visual guide](docs/visual-guide.md) for architecture, task lifecycle,
+and a three-agent handoff diagram.
+
 ### Connect an MCP client (local, stdio)
 
 Add to your client's MCP config (see `examples/mcp_config.example.json`):

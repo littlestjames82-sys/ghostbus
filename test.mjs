@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createBus, MemoryStore, FileStore } from './src/core.mjs';
+import { createBus, MemoryStore, FileStore, validateSnapshot } from './src/core.mjs';
 import { TOOLS, callTool } from './src/tools.mjs';
 
 let pass = 0, fail = 0;
@@ -774,6 +774,146 @@ await check('hosted hardening (v0.5.3): failed-auth throttle — 30 bad auths/mi
     assert.equal((await fetch('http://127.0.0.1:18391/api/workspaces', { headers: A })).status, 429);
     // open surfaces stay open (health is how operators notice an attack)
     assert.equal((await fetch('http://127.0.0.1:18391/health')).status, 200);
+  } finally { proc.kill(); }
+});
+
+/* ---------------- hostile input (v0.5.4) ---------------- */
+console.log('hostile input:');
+await check('hostile files (v0.5.4): __proto__/constructor/prototype refused at write, absent at read; path-like names are inert keys', async () => {
+  const dir = path.join(tmp, 'hostile-files');
+  const hb = await createBus(new FileStore(path.join(dir, 'store.json')), { name: 'Hostile Files' });
+  await hb.registerAgent({ name: 'mallory' });
+  // on v0.5.3 the first of these was ACCEPTED and silently replaced the
+  // files map's prototype — the "file" enumerated nowhere (store corrupted)
+  await assert.rejects(() => hb.putFile({ by: 'mallory', path: '__proto__', text: 'x' }), /reserved/);
+  await assert.rejects(() => hb.putFile({ by: 'mallory', path: 'constructor', text: 'x' }), /reserved/);
+  await assert.rejects(() => hb.putFile({ by: 'mallory', path: 'prototype', text: 'x' }), /reserved/);
+  await assert.rejects(() => hb.getFile('__proto__'), /not found/);
+  await assert.rejects(() => hb.getFile('constructor'), /not found/);
+  await assert.rejects(() => hb.deleteFile({ by: 'mallory', path: 'constructor' }), /not found/);
+  // the map is uncorrupted and works normally afterwards
+  await hb.putFile({ by: 'mallory', path: 'normal.md', text: 'fine' });
+  assert.deepEqual((await hb.listFiles()).map(f => f.path), ['normal.md']);
+  assert.equal(Object.getPrototypeOf(hb.state.files), Object.prototype);
+  // names that merely LOOK like paths are state keys only — nothing is
+  // written anywhere but the one store file ('..' stays refused, as before)
+  await hb.putFile({ by: 'mallory', path: '/abs/looking.txt', text: 'inert' });
+  await hb.putFile({ by: 'mallory', path: 'a\\b\\c.txt', text: 'inert' });
+  await hb.putFile({ by: 'mallory', path: 'nul\u0000byte.txt', text: 'inert' });
+  await assert.rejects(() => hb.putFile({ by: 'mallory', path: '../../evil', text: 'x' }), /\.\./);
+  assert.equal((await hb.getFile('/abs/looking.txt')).text, 'inert');
+  assert.deepEqual(fs.readdirSync(dir), ['store.json']);
+});
+
+await check('hostile snapshots (v0.5.4): deep validation refuses bricking states; __proto__ canaries never land', async () => {
+  const good = { workspace: { id: 'w', name: 'W' }, seq: 0, msgSeq: 0, taskSeq: 0, agents: [], messages: [], tasks: [], events: [], files: {}, context: null };
+  const mutated = (fn) => { const s = JSON.parse(JSON.stringify(good)); fn(s); return s; };
+  assert.equal(validateSnapshot(good), null); // the legit shape still validates
+  // every one of these PASSED the v0.5.3 shallow check and then broke the bus
+  assert.ok(validateSnapshot(mutated(s => { s.agents = [null]; })), 'null agent entry refused');
+  assert.ok(validateSnapshot(mutated(s => { s.tasks = ['x']; })), 'non-object task entry refused');
+  assert.ok(validateSnapshot(mutated(s => { s.messages = [42]; })), 'non-object message entry refused');
+  assert.ok(validateSnapshot(mutated(s => { s.agents = [{ name: 42 }]; })), 'non-string agent name refused');
+  assert.ok(validateSnapshot(mutated(s => { s.files = { 'a.txt': { text: 42 } }; })), 'non-string file text refused');
+  assert.ok(validateSnapshot(mutated(s => { s.seq = -1; })), 'negative counter refused');
+  assert.ok(validateSnapshot(mutated(s => { s.agents = Array.from({ length: 10_001 }, () => ({ name: 'a' })); })), 'absurd agent count refused');
+  assert.ok(validateSnapshot(mutated(s => { s.context = 'a string'; })), 'non-object context refused');
+  // a '__proto__' file name inside a snapshot envelope: refused, not imported
+  const hostile = JSON.parse('{"workspace":{"id":"w"},"seq":0,"msgSeq":0,"taskSeq":0,"agents":[],"messages":[],"tasks":[],"events":[],"files":{"__proto__":{"text":"x"}}}');
+  assert.ok(validateSnapshot(hostile), 'reserved file name in snapshot refused');
+  // restore of a bricking state is refused AND the live bus keeps working
+  const hb = await createBus(new MemoryStore(), { name: 'Canary' });
+  await hb.registerAgent({ name: 'eve' });
+  await assert.rejects(() => hb.restore(mutated(s => { s.agents = [null]; })), /invalid snapshot/);
+  assert.equal((await hb.listAgents()).length, 1);
+  // pollution canaries through the object entry points (context write,
+  // restore): JSON.parse + JSON clone + spread are own-property semantics,
+  // so the payloads store as inert data — Object.prototype must stay clean
+  await hb.putContext({ by: 'eve', context: JSON.parse('{"__proto__":{"polluted":"yes"},"ok":1}') });
+  const nested = mutated(s => {
+    s.workspace = JSON.parse('{"id":"w","name":"W","__proto__":{"polluted":"yes"}}');
+    s.context = JSON.parse('{"__proto__":{"polluted":"yes"}}');
+  });
+  await hb.restore(nested);
+  assert.equal({}.polluted, undefined);
+  assert.equal(Object.prototype.polluted, undefined);
+  assert.deepEqual(Object.keys({}), []);
+});
+
+await check('hostile channels (v0.5.4): a channel named __proto__ is counted, not dropped', async () => {
+  const hb = await createBus(new MemoryStore(), { name: 'Channels' });
+  await hb.registerAgent({ name: 'a1' });
+  await hb.sendMessage({ from: 'a1', body: 'one', channel: '__proto__' });
+  await hb.sendMessage({ from: 'a1', body: 'two', channel: '__proto__' });
+  await hb.sendMessage({ from: 'a1', body: 'three', channel: 'general' });
+  const chans = await hb.listChannels();
+  assert.equal(chans.find(c => c.channel === '__proto__')?.messages, 2); // v0.5.3 silently lost both
+  assert.equal(chans.find(c => c.channel === 'general')?.messages, 1);
+});
+
+await check('hosted hostile input (v0.5.4): traversal ids refused at create + import; hostile envelopes refused; legit import still lands', async () => {
+  const dataDir = path.join(tmp, 'hosted-hostile');
+  const env = { ...process.env, GHOSTBUS_ADMIN_KEY: 'hostile-admin-secret' };
+  const proc = spawn('node', ['src/hosted-server.mjs', '--port', '18392', '--data-dir', dataDir], { cwd: new URL('.', import.meta.url).pathname, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const A = { 'content-type': 'application/json', 'x-bus-key': 'hostile-admin-secret' };
+  const J = (r) => r.json();
+  const create = (body) => fetch('http://127.0.0.1:18392/api/workspaces', { method: 'POST', headers: A, body: JSON.stringify(body) });
+  const imp = (body) => fetch('http://127.0.0.1:18392/api/workspaces/import', { method: 'POST', headers: A, body: JSON.stringify(body) });
+  try {
+    for (let i = 0; i < 50; i++) { try { const r = await fetch('http://127.0.0.1:18392/health'); if (r.ok) break; } catch {} await new Promise(r => setTimeout(r, 100)); }
+    // traversal / separator / reserved ids at CREATE
+    for (const bad of ['../../evil', '..', 'a/b', 'a\\b', 'a.b', '__proto__', 'a'.repeat(64), 'UPPER', '-leading-dash']) {
+      assert.equal((await create({ id: bad })).status, 400, `create id ${JSON.stringify(bad)} must be 400`);
+    }
+    // a real export envelope (built by the current code) is the compat bar
+    const src = await createBus(new MemoryStore(), { name: 'Src' });
+    await src.registerAgent({ name: 'src-agent' });
+    const state = await src.snapshot();
+    const envelope = { ghostbusExport: 1, version: '0.5.4', workspace: { id: 'srcws', name: 'Src' }, state };
+    // traversal via the explicit import id…
+    assert.equal((await imp({ ...envelope, id: '../../evil' })).status, 400);
+    // …via the envelope's workspace id (no explicit id)…
+    const envIdTrav = JSON.parse(JSON.stringify(envelope)); envIdTrav.workspace.id = '../../evil';
+    assert.equal((await imp(envIdTrav)).status, 400);
+    // …and via state.workspace.id alone (no envelope workspace either)
+    const stateIdTrav = JSON.parse(JSON.stringify(state)); stateIdTrav.workspace.id = '../../evil';
+    assert.equal((await imp({ state: stateIdTrav })).status, 400);
+    // hostile envelope: reserved file name inside the state
+    const envBad = JSON.parse(JSON.stringify(envelope));
+    envBad.state.files = JSON.parse('{"__proto__":{"text":"x","updatedBy":"eve","updatedAt":"2026-01-01T00:00:00.000Z"}}');
+    assert.equal((await imp(envBad)).status, 400);
+    // the legit envelope imports cleanly — compatibility is a hard constraint
+    const ok = await imp(envelope);
+    assert.equal(ok.status, 201);
+    const okBody = await J(ok);
+    assert.equal(okBody.id, 'srcws'); assert.equal(okBody.agents, 1);
+    // nothing was written outside (or astray inside) the data dir
+    assert.deepEqual(fs.readdirSync(dataDir).sort(), ['registry.json', 'srcws.json']);
+    assert.ok(!fs.existsSync(path.join(tmp, 'evil.json')));
+  } finally { proc.kill(); }
+});
+
+await check('hosted hostile input (v0.5.4): a planted registry entry cannot escape the data dir', async () => {
+  const dataDir = path.join(tmp, 'hosted-planted');
+  fs.mkdirSync(dataDir, { recursive: true });
+  // a valid state file OUTSIDE the data dir + a registry inside it whose
+  // only entry points out at it with a traversal id. On v0.5.3 the admin
+  // list happily loaded and reported this workspace; the id must now be
+  // filtered at load and refused at resolution.
+  const outside = { workspace: { id: 'escape', name: 'Escaped' }, seq: 0, msgSeq: 0, taskSeq: 0, agents: [{ name: 'ghost', role: '', capabilities: [], joinedAt: '2026-01-01T00:00:00.000Z', lastSeenAt: '2026-01-01T00:00:00.000Z' }], messages: [], tasks: [], events: [], files: {}, context: null };
+  fs.writeFileSync(path.join(tmp, 'escape.json'), JSON.stringify(outside));
+  fs.writeFileSync(path.join(dataDir, 'registry.json'), JSON.stringify({ workspaces: { '../escape': { name: 'Escaped', keyHash: '0'.repeat(64), createdAt: '2026-01-01T00:00:00.000Z' } } }));
+  const env = { ...process.env, GHOSTBUS_ADMIN_KEY: 'planted-admin-secret' };
+  const proc = spawn('node', ['src/hosted-server.mjs', '--port', '18393', '--data-dir', dataDir], { cwd: new URL('.', import.meta.url).pathname, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const A = { 'content-type': 'application/json', 'x-bus-key': 'planted-admin-secret' };
+  const J = (r) => r.json();
+  try {
+    for (let i = 0; i < 50; i++) { try { const r = await fetch('http://127.0.0.1:18393/health'); if (r.ok) break; } catch {} await new Promise(r => setTimeout(r, 100)); }
+    const list = await J(await fetch('http://127.0.0.1:18393/api/workspaces', { headers: A }));
+    assert.equal(list.workspaces.length, 0, 'planted traversal entry must be ignored, not loaded');
+    assert.equal((await fetch('http://127.0.0.1:18393/w/escape/probe')).status, 404);
+    // the outside file was not so much as rewritten by a status() sweep
+    assert.equal(JSON.parse(fs.readFileSync(path.join(tmp, 'escape.json'), 'utf8')).agents.length, 1);
   } finally { proc.kill(); }
 });
 

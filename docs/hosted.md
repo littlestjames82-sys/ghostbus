@@ -138,6 +138,33 @@ Round 2 (v0.5.3) closed the next layer:
 - **Reporting a vulnerability:** see `SECURITY.md` at the repo root
   (private email reporting, one-business-day acknowledgement).
 
+Round 3 (v0.5.4) hardened the input surface — values a hostile or buggy
+client controls, followed to the filesystem, the object graph, and state
+validation:
+
+- **Workspace ids are validated at every boundary.** Create and import
+  require `^[a-z0-9][a-z0-9-]{1,62}$`, the workspace routes only match that
+  shape, workspace resolution re-checks it, and the registry file itself is
+  filtered through the same rule when loaded — a planted or hand-edited
+  registry entry can never turn an id into a path outside the data dir.
+- **Shared-file names are state keys, never paths.** A name that merely
+  looks like a path is stored and returned as an inert key. The three names
+  that are special to a JavaScript object — `__proto__`, `constructor`,
+  `prototype` — are refused at write, treated as absent at read, and refused
+  inside snapshots (before v0.5.4, writing a file named `__proto__`
+  silently corrupted the workspace's file map).
+- **Snapshots and imports are deeply validated.** Collection entries must
+  be usable objects (agents need string names, files need string text),
+  counters must be finite and non-negative, and counts carry sanity caps
+  far above anything the bus itself produces. Every export made by
+  v0.5.0–v0.5.3 still imports — compatibility is covered by tests, not
+  assumed.
+- **Prototype pollution is not reachable.** State enters only through
+  `JSON.parse`, JSON round-trip cloning, and spread (all own-property
+  semantics); there is no recursive merge of caller data anywhere in the
+  codebase, and the suite carries canary checks that try anyway through
+  the context writer and restore payloads.
+
 ## Option B — serverless on Netlify (Blobs)
 
 `deploy/netlify/` contains a Netlify Function implementing the same multi-workspace semantics over Netlify Blobs (strong consistency):

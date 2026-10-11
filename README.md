@@ -23,7 +23,7 @@ Built and in use: 29 MCP tools across presence, messages, tasks, a shared worksp
 ```bash
 git clone https://github.com/littlestjames82-sys/ghostbus.git ghostbus && cd ghostbus
 node examples/two-agent-demo.mjs   # watch a planner and a builder cooperate
-node test.mjs                      # 54 checks: core, tokens, capsules, dependencies, sync, persistence, concurrency, MCP stdio, HTTP, SSE, CLI, hosted security
+node test.mjs                      # 59 checks: core, tokens, capsules, dependencies, sync, persistence, concurrency, MCP stdio, HTTP, SSE, CLI, hosted security, hostile input
 node examples/three-agent-team.mjs # planner + builder + reviewer, no human relaying
 ```
 

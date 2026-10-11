@@ -27,6 +27,10 @@
  *   per IP at this layer, JSON bodies are capped at 1 MB (413), registry +
  *   workspace files are written 0600, HTML pages carry CSP/frame headers,
  *   and every admin action is audit-logged to stderr (never keys/hashes).
+ * - v0.5.4: workspace ids are validated at EVERY boundary — create, import,
+ *   route matching (regex), workspace resolution, and the registry itself
+ *   when loaded: ids become file names inside the data dir, so a planted or
+ *   hand-edited registry entry must never turn one into a path outside it.
  */
 import http from 'node:http';
 import fs from 'node:fs';
@@ -62,7 +66,26 @@ if (!REQUIRE_TOKENS) {
 
 fs.mkdirSync(dataDir, { recursive: true });
 const registryPath = path.join(dataDir, 'registry.json');
-const loadRegistry = () => { try { return JSON.parse(fs.readFileSync(registryPath, 'utf8')); } catch { return { workspaces: {} }; } };
+const validId = (id) => /^[a-z0-9][a-z0-9-]{1,62}$/.test(String(id || ''));
+const warnedRegistryIds = new Set();
+const loadRegistry = () => {
+  let reg;
+  try { reg = JSON.parse(fs.readFileSync(registryPath, 'utf8')); } catch { return { workspaces: {} }; }
+  if (!reg || typeof reg !== 'object' || !reg.workspaces || typeof reg.workspaces !== 'object') return { workspaces: {} };
+  // Defense in depth (v0.5.4): create/import validate ids, but the registry
+  // is also a file on disk — never let a planted or hand-edited entry turn
+  // into a path outside the data dir via getWorkspace's `${id}.json`.
+  for (const id of Object.keys(reg.workspaces)) {
+    if (!validId(id)) {
+      if (!warnedRegistryIds.has(id)) {
+        warnedRegistryIds.add(id);
+        process.stderr.write(`ghostbus hosted: ignoring registry entry with invalid workspace id ${JSON.stringify(id)} (ids become file names inside the data dir)\n`);
+      }
+      delete reg.workspaces[id];
+    }
+  }
+  return reg;
+};
 const saveRegistry = (reg) => {
   // Unique temp per save: two processes sharing this registry must never
   // collide on one fixed '.tmp' name (first rename wins, second throws ENOENT).
@@ -77,10 +100,10 @@ const saveRegistry = (reg) => {
   }
 };
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
-const validId = (id) => /^[a-z0-9][a-z0-9-]{1,62}$/.test(String(id || ''));
 
 const buses = new Map(); // id -> {bus, handle}
 async function getWorkspace(id) {
+  if (!validId(id)) return null; // an id is a file name inside dataDir — nothing else resolves (v0.5.4)
   if (buses.has(id)) return buses.get(id);
   const reg = loadRegistry();
   const meta = reg.workspaces[id];

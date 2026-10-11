@@ -14,7 +14,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 
-export const GHOSTBUS_VERSION = '0.5.3';
+export const GHOSTBUS_VERSION = '0.5.4';
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 // Timing-safe equality for hex digests (v0.5.3): secret comparisons must not
 // short-circuit on the first differing character the way === does.
@@ -24,6 +24,15 @@ const hashEqHex = (aHex, bHex) => {
 };
 export const TASK_STATUSES = ['queued', 'claimed', 'needs-approval', 'done', 'cancelled'];
 const CLAIM_LEASE_MS = 15 * 60 * 1000;
+// Shared-file names are keys in one plain object, never filesystem paths —
+// but three names are special to the object itself (v0.5.4): assigning
+// files['__proto__'] invokes the prototype setter and silently replaces the
+// map's prototype (the "file" then enumerates nowhere and the store is
+// corrupted), while reading files['constructor'] / files['__proto__'] on a
+// fresh map returns inherited members instead of "not found". Writes refuse
+// the three outright; reads treat them as absent; snapshots may not carry
+// them either (validateSnapshot below).
+const RESERVED_FILE_NAMES = new Set(['__proto__', 'constructor', 'prototype']);
 
 const now = () => new Date().toISOString();
 const clone = (v) => JSON.parse(JSON.stringify(v));
@@ -392,6 +401,7 @@ export class GhostBus {
     this._requireAgent(by, token);
     if (!p || typeof text !== 'string') throw new Error('path and text required');
     if (String(p).includes('..')) throw new Error('path may not contain ..');
+    if (RESERVED_FILE_NAMES.has(p)) throw new Error('path is a reserved name');
     const prev = this.state.files[p];
     const history = prev ? [...(prev.history || []), { text: prev.text, updatedBy: prev.updatedBy, updatedAt: prev.updatedAt }].slice(-10) : [];
     this.state.files[p] = { text, updatedBy: by, updatedAt: now(), history };
@@ -403,7 +413,7 @@ export class GhostBus {
   async getFile(...args) { return this._serialized(() => this._getFile(...args)); }
   async _getFile(p, { withHistory = false } = {}) {
     await this.init();
-    const f = this.state.files[p];
+    const f = Object.prototype.hasOwnProperty.call(this.state.files, p) ? this.state.files[p] : undefined;
     if (!f) throw new Error(`file not found: ${p}`);
     const { history, ...rest } = f;
     return { path: p, ...clone(rest), versions: (history || []).length + 1, ...(withHistory ? { history: clone(history || []) } : {}) };
@@ -412,7 +422,7 @@ export class GhostBus {
   async fileHistory(...args) { return this._serialized(() => this._fileHistory(...args)); }
   async _fileHistory(p) {
     await this.init();
-    const f = this.state.files[p];
+    const f = Object.prototype.hasOwnProperty.call(this.state.files, p) ? this.state.files[p] : undefined;
     if (!f) throw new Error(`file not found: ${p}`);
     return { path: p, current: { text: f.text, updatedBy: f.updatedBy, updatedAt: f.updatedAt }, history: clone(f.history || []) };
   }
@@ -461,7 +471,7 @@ export class GhostBus {
   async _deleteFile({ by, path: p, token = null }) {
     await this.init();
     this._requireAgent(by, token);
-    if (!this.state.files[p]) throw new Error(`file not found: ${p}`);
+    if (!Object.prototype.hasOwnProperty.call(this.state.files, p)) throw new Error(`file not found: ${p}`);
     delete this.state.files[p];
     this._event('file.delete', by, `${by} deleted ${p}`);
     await this._save();
@@ -471,7 +481,9 @@ export class GhostBus {
   async listChannels(...args) { return this._serialized(() => this._listChannels(...args)); }
   async _listChannels() {
     await this.init();
-    const counts = {};
+    // Channel names are attacker-chosen strings; a null-prototype map counts
+    // '__proto__' like any other channel instead of dropping it (v0.5.4).
+    const counts = Object.create(null);
     for (const m of this.state.messages) counts[m.channel] = (counts[m.channel] || 0) + 1;
     return Object.entries(counts).map(([channel, messages]) => ({ channel, messages })).sort((a, b) => b.messages - a.messages);
   }
@@ -638,13 +650,46 @@ export class GhostBus {
 }
 
 /** Shape-check a candidate workspace snapshot. Returns null when valid,
- *  otherwise a short description of the first problem found. */
+ *  otherwise a short description of the first problem found.
+ *
+ *  v0.5.4 deepened this from "the collections exist" to "the collections are
+ *  usable": a snapshot is untrusted input (hosted import, CLI import,
+ *  restore), and the shallow check waved through states that then crashed
+ *  the bus on first use — agents:[null] (agent lookups destructure entries),
+ *  a file whose text is not a string (search/sizing throw), a negative seq
+ *  counter, a '__proto__' file name (see RESERVED_FILE_NAMES). Entries must
+ *  be objects, agents need string names (they are lookup keys), files need
+ *  string text, counters must be finite and non-negative, and counts get
+ *  sanity caps set far above anything the bus itself can produce (stored
+ *  messages trim at 10k, events at 5k), so every export made by v0.5.0–0.5.3
+ *  still validates. Unknown EXTRA top-level keys stay allowed on purpose:
+ *  rejecting them would break forward compatibility with newer exports for
+ *  no safety gain — the known keys are all typed here. */
+const SNAPSHOT_CAPS = { agents: 10_000, messages: 100_000, tasks: 100_000, events: 100_000, files: 10_000 };
+const isStateObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
 export function validateSnapshot(s) {
-  if (!s || typeof s !== 'object' || Array.isArray(s)) return 'not an object';
-  if (!s.workspace || typeof s.workspace !== 'object') return 'missing workspace';
-  for (const k of ['seq', 'msgSeq', 'taskSeq']) if (typeof s[k] !== 'number') return `missing numeric ${k}`;
-  for (const k of ['agents', 'messages', 'tasks', 'events']) if (!Array.isArray(s[k])) return `missing array ${k}`;
-  if (!s.files || typeof s.files !== 'object' || Array.isArray(s.files)) return 'missing files object';
+  if (!isStateObject(s)) return 'not an object';
+  if (!isStateObject(s.workspace)) return 'missing workspace';
+  if (s.workspace.id !== undefined && typeof s.workspace.id !== 'string') return 'workspace.id must be a string';
+  if (s.workspace.name !== undefined && typeof s.workspace.name !== 'string') return 'workspace.name must be a string';
+  for (const k of ['seq', 'msgSeq', 'taskSeq']) {
+    if (typeof s[k] !== 'number' || !Number.isFinite(s[k]) || s[k] < 0) return `missing numeric ${k}`;
+  }
+  for (const k of ['agents', 'messages', 'tasks', 'events']) {
+    if (!Array.isArray(s[k])) return `missing array ${k}`;
+    if (s[k].length > SNAPSHOT_CAPS[k]) return `${k} exceeds sanity cap ${SNAPSHOT_CAPS[k]}`;
+    for (const el of s[k]) if (!isStateObject(el)) return `${k} entries must be objects`;
+  }
+  for (const a of s.agents) if (typeof a.name !== 'string' || !a.name) return 'agent entries need a string name';
+  if (!isStateObject(s.files)) return 'missing files object';
+  const fileNames = Object.keys(s.files);
+  if (fileNames.length > SNAPSHOT_CAPS.files) return `files exceeds sanity cap ${SNAPSHOT_CAPS.files}`;
+  for (const name of fileNames) {
+    if (RESERVED_FILE_NAMES.has(name)) return `files may not use reserved name: ${name}`;
+    const f = s.files[name];
+    if (!isStateObject(f) || typeof f.text !== 'string') return `file ${name} must be an object with string text`;
+  }
+  if (s.context !== undefined && s.context !== null && !isStateObject(s.context)) return 'context must be an object or null';
   return null;
 }
 

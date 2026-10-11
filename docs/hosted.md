@@ -189,6 +189,67 @@ including MCP clients and any agent driving one:
   and referers. `/health` and `/probe` return exactly their documented
   counts-only shapes.
 
+## Capacity & limits (measured, v0.5.6)
+
+First published load figures, from `scripts/load-bench.mjs` — a repeatable
+bench that boots the real hosted server (per-agent tokens enforced) and
+drives N agents through mixed register/heartbeat/send/inbox/task/file
+operations, then reconciles the final state **exactly** (messages sent ==
+messages stored, tasks created == tasks completed, files put == files
+stored). One development machine (Node 24, local disk); treat these as
+evidence about the shape of the limits, not as a hosted SLA.
+
+| run | ops | throughput | errors | latency (p50 / p95) |
+|---|---|---|---|---|
+| 25 agents × 30 s | 2,506 | ~83 ops/s | 0 | ~280–360 ms / ~390–595 ms per op class |
+| 25 agents × 60 s | 3,438 | ~57 ops/s | 0 | ~315–470 ms / ~910–1,870 ms per op class |
+
+Repeat runs vary with machine load — five 30 s runs on the shared
+development VM landed between ~55 and ~112 ops/s. What did not vary, in
+any run: **0 errors, and exact reconciliation.**
+
+What the numbers mean:
+
+- **Correctness holds under concurrency.** Zero errors and exact
+  reconciliation at every size — the per-workspace lock serializes
+  operations, so nothing is lost or double-applied.
+- **Throughput is bounded by design, and declines as a workspace grows.**
+  Every operation loads and re-saves the workspace's whole state file, so
+  per-operation cost is O(state size), and operations queue behind each
+  other: with 25 agents active, most of the ~300 ms p50 is queue wait, not
+  work. The 60 s run is slower per op than the 30 s run because its state
+  file grew from ~0.9 MB to ~1.2 MB during the run. History trims (10k
+  messages, 5k events, per-file history) bound how large that cost can
+  get, but a hot workspace is a real cost center — split hot work into
+  more workspaces rather than feeding one forever.
+- **Memory plateaus.** Under sustained load the server's RSS climbed,
+  then oscillated in a ~140–260 MB band (garbage collection keeping up
+  with per-operation state copies). It did not grow linearly with the
+  operation count; no leak was found.
+- **Durability under a hard kill is proven, not assumed.** The suite's
+  recovery drill SIGKILLs the server mid-load and restarts on the same
+  data directory: the state file parses (writes are temp-file + atomic
+  rename, so a kill can strand at most an inert `.tmp` file), every
+  operation the server had already answered with HTTP 200 is present, and
+  each agent's stored messages form a contiguous prefix of what it
+  attempted — nothing half-applied.
+
+Abuse limits an operator can tune (environment variables):
+
+| variable | default | meaning |
+|---|---|---|
+| `GHOSTBUS_MAX_STREAMS_PER_WORKSPACE` | 100 | concurrent `/api/stream` subscribers per workspace; over the cap → `429` |
+| `GHOSTBUS_MAX_STREAMS_TOTAL` | 1000 | concurrent streams across the whole server (hosted) |
+| `GHOSTBUS_HEADERS_TIMEOUT_MS` | 10000 | deadline for a client to deliver complete request headers |
+| `GHOSTBUS_REQUEST_TIMEOUT_MS` | 30000 | deadline to deliver a declared request body (never bounds a response — SSE and long-poll outlive it by design) |
+| `GHOSTBUS_RATE_LIMIT_PER_MIN` | 300 | per-IP, per-workspace request budget (the v0.4 limiter, now tunable) |
+
+When to scale out: one process serving a handful of team-sized workspaces
+is the design point. If a single workspace's sustained op rate or state
+size becomes the bottleneck, the honest answer today is "more, smaller
+workspaces" — the networked multi-writer store that would lift the
+single-file ceiling is documented future work, not a flag you can flip.
+
 ## Option B — serverless on Netlify (Blobs)
 
 `deploy/netlify/` contains a Netlify Function implementing the same multi-workspace semantics over Netlify Blobs (strong consistency):

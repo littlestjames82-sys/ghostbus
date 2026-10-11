@@ -75,16 +75,117 @@ export const HTML_SECURITY_HEADERS = {
 
 const TOO_LARGE = Symbol('body-too-large');
 
+// Per-IP request limiter (per workspace — one handler serves one workspace).
+// The default (300/min) is unchanged since v0.3; GHOSTBUS_RATE_LIMIT_PER_MIN
+// is an operator knob for two legitimate cases: many agents behind one NAT
+// address sharing a single source IP, and load benchmarking, where the
+// limiter — not the bus — would otherwise be the first ceiling (v0.5.6).
+const rateLimitPerMin = () => {
+  const n = Number(process.env.GHOSTBUS_RATE_LIMIT_PER_MIN);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 300;
+};
+
+// Server timeouts (v0.5.6). Three different clocks, three different jobs:
+// - headersMs bounds how long a client may take to deliver complete request
+//   HEADERS (the classic slow-loris drip).
+// - requestMs bounds how long it may take to deliver the request BODY after
+//   that. It must never bound a response: /api/stream and /api/wait are
+//   long-lived BY DESIGN.
+// - keepAliveMs is Node's own idle keep-alive lifetime.
+// Why this is not just "set the three Node properties": Node's own
+// enforcement of both knobs was probed on Node 24 before this design was
+// chosen, and neither is a deterministic drop-in for the deadlines above.
+// - server.headersTimeout IS set (it only governs the header phase), but
+//   its enforcement rides on Node's socket-timeout machinery: with the
+//   default server.timeout of 0, a partial-headers socket was probed to
+//   survive 15 s at headersTimeout=1000.
+// - server.requestTimeout is pinned to 0: its semantics proved impossible
+//   to reason about safely for long-lived responses (a handler that
+//   writes constantly masks its clock entirely), and the deadline it is
+//   documented for — receiving the request — is exactly the one the
+//   guard below enforces deterministically instead.
+// The guard: arm the header deadline on connect, clear it when headers
+// land, bound a *declared* body from there, re-arm while the socket sits
+// between keep-alive requests. server.timeout stays 0 on purpose — socket
+// *inactivity* is not a deadline here, because a long-poll legitimately
+// idles for up to 55 s and an SSE stream between events for longer.
+export const SERVER_TIMEOUT_DEFAULTS = { headersMs: 10_000, requestMs: 30_000, keepAliveMs: 5_000 };
+export function applyServerTimeouts(server, opts = {}) {
+  const headersMs = opts.headersMs ?? SERVER_TIMEOUT_DEFAULTS.headersMs;
+  const requestMs = opts.requestMs ?? SERVER_TIMEOUT_DEFAULTS.requestMs;
+  const keepAliveMs = opts.keepAliveMs ?? SERVER_TIMEOUT_DEFAULTS.keepAliveMs;
+  server.headersTimeout = headersMs;
+  server.requestTimeout = 0; // see above — Node's clock kills live streams; the guard owns this deadline
+  server.keepAliveTimeout = keepAliveMs;
+  server.timeout = 0; // see above — inactivity is not the deadline
+  server.on('connection', (socket) => {
+    const armHeaderDeadline = () => {
+      clearTimeout(socket._gbHeaderTimer);
+      socket._gbHeaderTimer = setTimeout(() => socket.destroy(), headersMs);
+      socket._gbHeaderTimer.unref?.();
+    };
+    socket._gbArmHeaderDeadline = armHeaderDeadline;
+    armHeaderDeadline();
+    socket.on('close', () => clearTimeout(socket._gbHeaderTimer));
+  });
+  server.on('request', (req, res) => {
+    const socket = req.socket;
+    clearTimeout(socket._gbHeaderTimer); // headers are in — that deadline is met
+    clearTimeout(socket._gbBodyTimer);
+    // Bound the body ONLY when one was declared. req.complete cannot be
+    // the trigger: for a bodyless GET whose stream nobody reads (exactly
+    // the /api/stream and /api/wait shape) it stays false indefinitely, so
+    // a timer armed on it would destroy healthy long-lived exchanges —
+    // the first cut of this guard did precisely that to SSE streams.
+    const declaresBody = Number(req.headers['content-length'] || 0) > 0 || 'transfer-encoding' in req.headers;
+    if (declaresBody && !req.complete) {
+      socket._gbBodyTimer = setTimeout(() => socket.destroy(), requestMs);
+      socket._gbBodyTimer.unref?.();
+      const clear = () => clearTimeout(socket._gbBodyTimer);
+      req.on('end', clear);
+      req.on('close', clear);
+      res.on('finish', clear);
+      res.on('close', clear);
+    }
+    // Between keep-alive requests the socket owes us a fresh set of
+    // headers: re-arm the header deadline when this exchange finishes so a
+    // stalled *next* request is bounded too. A still-open response (SSE)
+    // never emits 'finish', and its request completed on arrival, so no
+    // timer is ever pending against a live stream or long-poll.
+    res.on('finish', () => { if (!socket.destroyed && socket._gbArmHeaderDeadline) socket._gbArmHeaderDeadline(); });
+    res.on('close', () => clearTimeout(socket._gbHeaderTimer));
+  });
+  return server;
+}
+
+// SSE stream caps (v0.5.6): before this round a workspace's /api/stream
+// subscribers were bounded by nothing but the request limiter — each one
+// holds a bus listener, a socket, and a 25 s ping interval, forever, and a
+// buggy client reconnect-looping could pile them up without limit. Caps are
+// generous against real teams (an agent holds at most a stream or two) and
+// refuse cleanly with 429 past them. The per-process total spans every
+// handler in the process, which is what protects the hosted server.
+const streamCap = (envName, def) => {
+  const n = Number(process.env[envName]);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : def;
+};
+let activeStreamsTotal = 0;
+
 export function createBusHandler({ id = 'default', bus, key = '' }) {
   const buckets = new Map();
+  const rateLimit = rateLimitPerMin();
   const rateOk = (req) => {
     const ip = (req.socket && req.socket.remoteAddress) || 'unknown';
     const t = Date.now();
+    // Opportunistic sweep: one bucket per source IP per minute would
+    // otherwise accumulate forever on a long-lived server (v0.5.6).
+    if (buckets.size > 4096) { for (const [k, v] of buckets) if (t - v.start > 60_000) buckets.delete(k); }
     let b = buckets.get(ip);
     if (!b || t - b.start > 60_000) { b = { start: t, count: 0 }; buckets.set(ip, b); }
     b.count += 1;
-    return b.count <= 300;
+    return b.count <= rateLimit;
   };
+  let activeStreams = 0; // this workspace's live /api/stream subscribers
   const keyOk = (req) => {
     if (!key) return true;
     const given = req.headers['x-bus-key'] || String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
@@ -99,7 +200,7 @@ export function createBusHandler({ id = 'default', bus, key = '' }) {
       res.writeHead(status, { 'content-type': type }); res.end(body);
     };
     if (!rateOk(req) && url.pathname !== '/health' && url.pathname !== '/probe') {
-      return send(429, { error: 'rate limit: 300 requests/min per IP per workspace' });
+      return send(429, { error: `rate limit: ${rateLimit} requests/min per IP per workspace` });
     }
     const send413 = () => {
       try {
@@ -124,15 +225,34 @@ export function createBusHandler({ id = 'default', bus, key = '' }) {
       if (req.method === 'GET' && url.pathname === '/api/stream') {
         const agent = url.searchParams.get('agent');
         if (!agent) return send(400, { error: 'agent query param required' });
+        // Stream caps (v0.5.6): refuse BEFORE opening the stream — a 429 the
+        // client can back off from, not a socket that dies later.
+        const maxPerWorkspace = streamCap('GHOSTBUS_MAX_STREAMS_PER_WORKSPACE', 100);
+        const maxTotal = streamCap('GHOSTBUS_MAX_STREAMS_TOTAL', 1000);
+        if (activeStreams >= maxPerWorkspace) return send(429, { error: `too many event streams for this workspace (limit ${maxPerWorkspace})` });
+        if (activeStreamsTotal >= maxTotal) return send(429, { error: `too many event streams on this server (limit ${maxTotal})` });
+        activeStreams += 1; activeStreamsTotal += 1;
         res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
         res.write(`event: ready\ndata: ${JSON.stringify({ agent, workspace: id, version: GHOSTBUS_VERSION })}\n\n`);
+        let cleaned = false;
         const off = bus.onEvent((ev) => {
           const forMe = ev.type === 'message.send' ? (ev.to === agent || ev.to === '*' || ev.actor === agent) : true;
           if (!forMe) return;
-          res.write(`event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`);
+          try { res.write(`event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`); } catch { cleanup(); }
         });
-        const ping = setInterval(() => res.write(': ping\n\n'), 25000);
-        req.on('close', () => { clearInterval(ping); off(); });
+        const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch { cleanup(); } }, 25000);
+        // Reaping (v0.5.6): whichever side of the connection dies first —
+        // request close, response close, or a write into a dead socket —
+        // the listener, the ping, and both cap slots are released exactly
+        // once, so churn can neither leak listeners nor strand cap slots.
+        function cleanup() {
+          if (cleaned) return; cleaned = true;
+          clearInterval(ping); off();
+          activeStreams -= 1; activeStreamsTotal -= 1;
+        }
+        req.on('close', cleanup);
+        res.on('close', cleanup);
+        res.on('error', cleanup);
         return;
       }
 

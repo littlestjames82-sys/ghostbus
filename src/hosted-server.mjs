@@ -37,7 +37,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { createBus, FileStore, GHOSTBUS_VERSION, validateSnapshot } from './core.mjs';
-import { createBusHandler, keyMatches, hashMatches, readJsonBody, MAX_BODY_BYTES, HTML_SECURITY_HEADERS } from './handler.mjs';
+import { createBusHandler, keyMatches, hashMatches, readJsonBody, MAX_BODY_BYTES, HTML_SECURITY_HEADERS, applyServerTimeouts, SERVER_TIMEOUT_DEFAULTS } from './handler.mjs';
 
 const argv = process.argv.slice(2);
 const argVal = (flag) => { const i = argv.indexOf(flag); return i >= 0 ? argv[i + 1] : null; };
@@ -145,6 +145,9 @@ const authThrottled = (ip) => {
 };
 const noteAuthFail = (ip) => {
   const t = Date.now();
+  // Opportunistic sweep (v0.5.6): one entry per attacking IP per window
+  // would otherwise accumulate forever on a long-lived server.
+  if (authFails.size > 4096) { for (const [k, v] of authFails) if (t - v.start > AUTH_FAIL_WINDOW_MS) authFails.delete(k); }
   let b = authFails.get(ip);
   if (!b || t - b.start > AUTH_FAIL_WINDOW_MS) { b = { start: t, count: 0 }; authFails.set(ip, b); }
   b.count += 1;
@@ -314,6 +317,15 @@ const server = http.createServer(async (req, res) => {
     process.stderr.write(`ghostbus hosted: internal error: ${(e && e.stack) || e}\n`);
     return send(500, { error: 'internal error' });
   }
+});
+
+// Explicit server timeouts (v0.5.6): slow-loris header/body deadlines, set
+// here rather than inherited from Node defaults — see applyServerTimeouts
+// in handler.mjs for the scoping (long-lived streams are never bounded).
+const timeoutOpt = (envName, def) => { const n = Number(process.env[envName]); return Number.isFinite(n) && n > 0 ? Math.floor(n) : def; };
+applyServerTimeouts(server, {
+  headersMs: timeoutOpt('GHOSTBUS_HEADERS_TIMEOUT_MS', SERVER_TIMEOUT_DEFAULTS.headersMs),
+  requestMs: timeoutOpt('GHOSTBUS_REQUEST_TIMEOUT_MS', SERVER_TIMEOUT_DEFAULTS.requestMs),
 });
 
 server.listen(port, () => {

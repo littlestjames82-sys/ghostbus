@@ -14,7 +14,7 @@
  */
 import http from 'node:http';
 import { createBus, MemoryStore, FileStore, GHOSTBUS_VERSION } from './core.mjs';
-import { createBusHandler } from './handler.mjs';
+import { createBusHandler, applyServerTimeouts, SERVER_TIMEOUT_DEFAULTS } from './handler.mjs';
 
 const argv = process.argv.slice(2);
 const argVal = (flag) => { const i = argv.indexOf(flag); return i >= 0 ? argv[i + 1] : null; };
@@ -31,6 +31,14 @@ const handle = createBusHandler({ id: 'default', bus, key: KEY });
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://localhost');
   handle(req, res, url).catch((e) => { process.stderr.write(`ghostbus relay: internal error: ${(e && e.stack) || e}\n`); try { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'internal error' })); } catch {} });
+});
+// Explicit server timeouts (v0.5.6): slow-loris header/body deadlines, set
+// here rather than inherited from Node defaults — see applyServerTimeouts
+// in handler.mjs for the scoping (long-lived streams are never bounded).
+const timeoutOpt = (envName, def) => { const n = Number(process.env[envName]); return Number.isFinite(n) && n > 0 ? Math.floor(n) : def; };
+applyServerTimeouts(server, {
+  headersMs: timeoutOpt('GHOSTBUS_HEADERS_TIMEOUT_MS', SERVER_TIMEOUT_DEFAULTS.headersMs),
+  requestMs: timeoutOpt('GHOSTBUS_REQUEST_TIMEOUT_MS', SERVER_TIMEOUT_DEFAULTS.requestMs),
 });
 server.listen(port, () => {
   process.stderr.write(`ghostbus http relay v${GHOSTBUS_VERSION} · http://127.0.0.1:${port} · store=${storePath} · auth=${KEY ? 'workspace key required' : 'open (set GHOSTBUS_KEY)'}\n`);

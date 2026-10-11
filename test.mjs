@@ -1146,6 +1146,220 @@ await check('cli (v0.5.5): bad invocations exit non-zero with one-line errors, n
   assert.ok(!badClaim.stderr.includes('\n    at '), 'stack frames leaked to the user');
 });
 
+/* ---------------- load & resilience (v0.5.6) ---------------- */
+console.log('load & resilience:');
+await check('load bench smoke (v0.5.6): concurrent agents on one hosted workspace reconcile exactly', async () => {
+  const { runBench } = await import('./scripts/load-bench.mjs');
+  const r = await runBench({ agents: 6, seconds: 3, port: 18410, quiet: true });
+  assert.equal(r.totalErrors, 0, `bench errors; server stderr tail: ${r.serverStderrTail}`);
+  assert.ok(r.reconciled, r.mismatches.join('; '));
+  assert.ok(r.totalOps > 100, `suspiciously few ops completed: ${r.totalOps}`);
+  assert.ok(r.counters.messagesSent > 0 && r.counters.tasksCompleted > 0 && r.counters.filesPut > 0, 'a whole op class never landed');
+});
+
+await check('server timeouts (v0.5.6): loris socket dies at the header deadline; SSE + long-poll outlive every deadline', async () => {
+  const net = await import('node:net');
+  const env = { ...process.env, GHOSTBUS_HEADERS_TIMEOUT_MS: '400', GHOSTBUS_REQUEST_TIMEOUT_MS: '800' };
+  const proc = spawn('node', ['src/http-server.mjs', '--port', '18411', '--store', ':memory:'], { cwd: new URL('.', import.meta.url).pathname, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const H = { 'content-type': 'application/json' };
+  try {
+    for (let i = 0; i < 50; i++) { try { const r = await fetch('http://127.0.0.1:18411/health'); if (r.ok) break; } catch {} await new Promise(r => setTimeout(r, 100)); }
+    // slow loris: complete the TCP connection, send HALF the headers, stall.
+    const loris = await new Promise((resolve) => {
+      const t0 = Date.now();
+      const sock = net.connect(18411, '127.0.0.1', () => sock.write('GET /api/status HTTP/1.1\r\nHost: x\r\n'));
+      sock.on('close', () => resolve(Date.now() - t0));
+      sock.on('error', () => resolve(Date.now() - t0));
+      setTimeout(() => { sock.destroy(); resolve(-1); }, 3000);
+    });
+    assert.ok(loris > 250 && loris < 3000, `partial-headers socket should die at the ~400ms deadline, outcome: ${loris}ms`);
+    // slow body drip: full headers announcing 100 bytes, 5 delivered, stall —
+    // the request-receipt deadline (800ms here) must reap this one too.
+    const drip = await new Promise((resolve) => {
+      const t0 = Date.now();
+      const sock = net.connect(18411, '127.0.0.1', () => sock.write('POST /api/messages HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n12345'));
+      sock.on('close', () => resolve(Date.now() - t0));
+      sock.on('error', () => resolve(Date.now() - t0));
+      setTimeout(() => { sock.destroy(); resolve(-1); }, 3000);
+    });
+    assert.ok(drip > 500 && drip < 3000, `slow-body socket should die at the ~800ms deadline, outcome: ${drip}ms`);
+    // an SSE stream established now must still be alive — and delivering —
+    // well past BOTH the 400ms header and 800ms request deadlines.
+    await fetch('http://127.0.0.1:18411/api/agents', { method: 'POST', headers: H, body: JSON.stringify({ agent: 't-out-a' }) });
+    await fetch('http://127.0.0.1:18411/api/agents', { method: 'POST', headers: H, body: JSON.stringify({ agent: 't-out-b' }) });
+    const ctrl = new AbortController();
+    const resp = await fetch('http://127.0.0.1:18411/api/stream?agent=t-out-b', { signal: ctrl.signal });
+    assert.equal(resp.status, 200);
+    const reader = resp.body.getReader();
+    const readUntil = async (needle, tries = 30) => {
+      let buf = '';
+      for (let i = 0; i < tries; i++) {
+        const { value, done } = await Promise.race([reader.read(), new Promise(r => setTimeout(() => r({ done: true }), 250))]);
+        if (done) break;
+        buf += new TextDecoder().decode(value);
+        if (buf.includes(needle)) return buf;
+      }
+      return buf;
+    };
+    assert.ok((await readUntil('ready')).includes('ready'));
+    await new Promise(r => setTimeout(r, 1200)); // past both deadlines
+    await fetch('http://127.0.0.1:18411/api/messages', { method: 'POST', headers: H, body: JSON.stringify({ agent: 't-out-a', to: 't-out-b', body: 'still alive past the deadlines' }) });
+    assert.ok((await readUntil('still alive past the deadlines')).includes('message.send'), 'SSE stream was killed by a server timeout');
+    ctrl.abort();
+    // a 2s long-poll likewise outlives the 800ms request deadline and
+    // resolves on its own timeout with waited:true.
+    const w0 = Date.now();
+    const waited = await (await fetch('http://127.0.0.1:18411/api/wait?agent=t-out-b&timeout=2')).json();
+    const wElapsed = Date.now() - w0;
+    assert.equal(waited.waited, true);
+    assert.ok(wElapsed >= 1800 && wElapsed < 5000, `long-poll resolved at ${wElapsed}ms`);
+  } finally { proc.kill(); }
+});
+
+await check('SSE caps (v0.5.6): per-workspace cap refuses with 429, freed slots reopen, listeners reap to zero', async () => {
+  const env = { ...process.env, GHOSTBUS_MAX_STREAMS_PER_WORKSPACE: '3' };
+  const proc = spawn('node', ['src/http-server.mjs', '--port', '18412', '--store', ':memory:'], { cwd: new URL('.', import.meta.url).pathname, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const openStream = async (base, agent) => {
+    const ctrl = new AbortController();
+    const resp = await fetch(`${base}/api/stream?agent=${agent}`, { signal: ctrl.signal });
+    return { ctrl, resp };
+  };
+  try {
+    for (let i = 0; i < 50; i++) { try { const r = await fetch('http://127.0.0.1:18412/health'); if (r.ok) break; } catch {} await new Promise(r => setTimeout(r, 100)); }
+    await fetch('http://127.0.0.1:18412/api/agents', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ agent: 'cap-agent' }) });
+    const s1 = await openStream('http://127.0.0.1:18412', 'cap-agent');
+    const s2 = await openStream('http://127.0.0.1:18412', 'cap-agent');
+    const s3 = await openStream('http://127.0.0.1:18412', 'cap-agent');
+    assert.deepEqual([s1.resp.status, s2.resp.status, s3.resp.status], [200, 200, 200]);
+    const fourth = await fetch('http://127.0.0.1:18412/api/stream?agent=cap-agent');
+    assert.equal(fourth.status, 429, 'fourth stream over the cap of 3 must be refused');
+    assert.match((await fourth.json()).error, /too many event streams/);
+    s1.ctrl.abort();
+    await new Promise(r => setTimeout(r, 300)); // let the close land server-side
+    const reopened = await openStream('http://127.0.0.1:18412', 'cap-agent');
+    assert.equal(reopened.resp.status, 200, 'a freed slot must reopen');
+    s2.ctrl.abort(); s3.ctrl.abort(); reopened.ctrl.abort();
+  } finally { proc.kill(); }
+  // reaping, proven where the listeners live: an in-process handler + bus.
+  const { createBusHandler } = await import('./src/handler.mjs');
+  const { createServer } = await import('node:http');
+  const ibus = await createBus(new MemoryStore(), { name: 'Reap Test' });
+  await ibus.registerAgent({ name: 'reaper' });
+  const handler = createBusHandler({ id: 'reap', bus: ibus, key: '' });
+  const srv = createServer((req, res) => { handler(req, res, new URL(req.url, 'http://localhost')).catch(() => {}); });
+  await new Promise(r => srv.listen(0, '127.0.0.1', r));
+  const ibase = `http://127.0.0.1:${srv.address().port}`;
+  try {
+    assert.equal(ibus.listeners.size, 0);
+    const ctrls = [];
+    for (let i = 0; i < 5; i++) {
+      const ctrl = new AbortController(); ctrls.push(ctrl);
+      const resp = await fetch(`${ibase}/api/stream?agent=reaper`, { signal: ctrl.signal });
+      assert.equal(resp.status, 200);
+      resp.body.getReader().read().catch(() => {}); // drain in background
+    }
+    for (let i = 0; i < 40 && ibus.listeners.size !== 5; i++) await new Promise(r => setTimeout(r, 50));
+    assert.equal(ibus.listeners.size, 5, 'each open stream holds exactly one bus listener');
+    for (const c of ctrls) c.abort();
+    for (let i = 0; i < 40 && ibus.listeners.size !== 0; i++) await new Promise(r => setTimeout(r, 50));
+    assert.equal(ibus.listeners.size, 0, 'after churn, every listener must be reaped — none leak');
+  } finally { srv.close(); }
+});
+
+await check('wait pile-up (v0.5.6): 25 concurrent long-polls all wake on one broadcast; idle waits all time out cleanly', async () => {
+  const storeFile = path.join(tmp, 'pileup.json');
+  const proc = spawn('node', ['src/http-server.mjs', '--port', '18413', '--store', storeFile], { cwd: new URL('.', import.meta.url).pathname, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stderr = '';
+  proc.stderr.on('data', (d) => { stderr += d; });
+  const H = { 'content-type': 'application/json' };
+  try {
+    for (let i = 0; i < 50; i++) { try { const r = await fetch('http://127.0.0.1:18413/health'); if (r.ok) break; } catch {} await new Promise(r => setTimeout(r, 100)); }
+    const names = Array.from({ length: 25 }, (_, i) => `pile-${i}`);
+    for (const n of names) await fetch('http://127.0.0.1:18413/api/agents', { method: 'POST', headers: H, body: JSON.stringify({ agent: n }) });
+    await fetch('http://127.0.0.1:18413/api/agents', { method: 'POST', headers: H, body: JSON.stringify({ agent: 'pile-sender' }) });
+    const t0 = Date.now();
+    const waits = names.map(n => fetch(`http://127.0.0.1:18413/api/wait?agent=${n}&timeout=6`).then(r => r.json()));
+    await new Promise(r => setTimeout(r, 300)); // all 25 parked
+    await fetch('http://127.0.0.1:18413/api/messages', { method: 'POST', headers: H, body: JSON.stringify({ agent: 'pile-sender', to: '*', body: 'pile-up wake' }) });
+    const results = await Promise.all(waits);
+    const wakeElapsed = Date.now() - t0;
+    assert.ok(results.every(r => r.waited === true && r.events.some(e => e.type === 'message.send')), 'every parked wait must wake with the broadcast');
+    assert.ok(wakeElapsed < 5000, `pile-up took ${wakeElapsed}ms to drain`);
+    const i0 = Date.now();
+    const idle = await Promise.all(Array.from({ length: 10 }, (_, i) => fetch(`http://127.0.0.1:18413/api/wait?agent=pile-${i}&timeout=1`).then(r => r.json())));
+    const idleElapsed = Date.now() - i0;
+    assert.ok(idle.every(r => r.waited === true && r.events.length === 0), 'idle waits must resolve empty on timeout');
+    assert.ok(idleElapsed >= 900 && idleElapsed < 4000, `idle waits resolved at ${idleElapsed}ms — hang or early return`);
+    assert.ok(!/unhandled/i.test(stderr), `server logged an unhandled rejection: ${stderr.slice(-200)}`);
+  } finally { proc.kill(); }
+});
+
+await check('recovery drill (v0.5.6): SIGKILL mid-load, restart on the same data dir — state parses, acked work is a clean prefix', async () => {
+  const dataDir = path.join(tmp, 'drill-data');
+  const env = { ...process.env, GHOSTBUS_ADMIN_KEY: 'drill-admin-secret-0123' };
+  const cwd = new URL('.', import.meta.url).pathname;
+  const boot = () => spawn('node', ['src/hosted-server.mjs', '--port', '18414', '--data-dir', dataDir], { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const waitUp = async () => { for (let i = 0; i < 50; i++) { try { const r = await fetch('http://127.0.0.1:18414/health'); if (r.ok) return; } catch {} await new Promise(r => setTimeout(r, 100)); } throw new Error('drill server did not come up'); };
+  const A = { 'content-type': 'application/json', 'x-bus-key': 'drill-admin-secret-0123' };
+  let proc = boot();
+  try {
+    await waitUp();
+    const ws = await (await fetch('http://127.0.0.1:18414/api/workspaces', { method: 'POST', headers: A, body: JSON.stringify({ id: 'drill', name: 'Drill' }) })).json();
+    const WK = { 'content-type': 'application/json', 'x-bus-key': ws.key };
+    const agents = ['d0', 'd1', 'd2'];
+    const acked = { d0: [], d1: [], d2: [] };       // message seqs whose POST returned 200
+    const ackedFiles = { d0: [], d1: [], d2: [] };  // file paths whose PUT returned 200
+    const attempted = { d0: 0, d1: 0, d2: 0 };     // highest message seq attempted
+    let stopped = false;
+    const driver = async (name) => {
+      const reg = await (await fetch('http://127.0.0.1:18414/w/drill/api/agents', { method: 'POST', headers: WK, body: JSON.stringify({ agent: name }) })).json();
+      const TH = { ...WK, 'x-agent-token': reg.token };
+      let k = 0;
+      while (!stopped) {
+        k += 1; attempted[name] = k;
+        try {
+          const r = await fetch('http://127.0.0.1:18414/w/drill/api/messages', { method: 'POST', headers: TH, body: JSON.stringify({ agent: name, to: '*', body: `drill ${name} seq ${k}` }) });
+          if (r.status === 200) acked[name].push(k); else break;
+          if (k % 4 === 0) {
+            const p = `drill/${name}/${k}.txt`;
+            const fr = await fetch('http://127.0.0.1:18414/w/drill/api/files', { method: 'PUT', headers: TH, body: JSON.stringify({ agent: name, path: p, text: `drill file ${k}` }) });
+            if (fr.status === 200) ackedFiles[name].push(p);
+          }
+        } catch { break; } // socket died with the kill — expected
+      }
+    };
+    const drivers = agents.map(a => driver(a));
+    await new Promise(r => setTimeout(r, 1200)); // load in flight…
+    proc.kill('SIGKILL');                          // …power cut, no cleanup
+    stopped = true;
+    await Promise.allSettled(drivers);
+    await new Promise(r => setTimeout(r, 200));
+    // restart on the SAME data dir
+    proc = boot();
+    await waitUp();
+    const status = await (await fetch('http://127.0.0.1:18414/w/drill/api/status', { headers: WK })).json();
+    assert.equal(status.agents, 3);
+    // the state file itself must parse — the atomic rename means a kill can
+    // strand at most an orphaned .tmp, never a torn main file.
+    const state = JSON.parse(fs.readFileSync(path.join(dataDir, 'drill.json'), 'utf8'));
+    assert.equal(status.messages, state.messages.length, 'restarted server and state file disagree');
+    for (const name of agents) {
+      const stored = state.messages
+        .filter(m => m.from === name && typeof m.body === 'string' && m.body.startsWith(`drill ${name} seq `))
+        .map(m => Number(m.body.split('seq ')[1]))
+        .sort((a, b) => a - b);
+      // stored seqs are a contiguous prefix 1..m of what the agent attempted
+      assert.deepEqual(stored, Array.from({ length: stored.length }, (_, i) => i + 1), `${name}: stored messages are not a clean prefix: ${stored.slice(0, 20)}`);
+      // everything the server ACKED (HTTP 200) before the kill is durable
+      for (const k of acked[name]) assert.ok(stored.includes(k), `${name}: acked message ${k} lost in the kill`);
+      assert.ok(stored.length >= acked[name].length && stored.length <= attempted[name], `${name}: stored ${stored.length} outside [acked ${acked[name].length}, attempted ${attempted[name]}]`);
+      const storedFiles = new Set(Object.keys(state.files));
+      for (const p of ackedFiles[name]) assert.ok(storedFiles.has(p), `${name}: acked file ${p} lost in the kill`);
+    }
+    assert.ok(acked.d0.length + acked.d1.length + acked.d2.length >= 30, 'drill did not move enough traffic to mean anything');
+  } finally { proc.kill('SIGKILL'); }
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 fs.rmSync(tmp, { recursive: true, force: true });
 process.exit(fail ? 1 : 0);

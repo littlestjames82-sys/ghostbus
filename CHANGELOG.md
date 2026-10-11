@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.10 — 2026-10-11
+
+Release-pipeline fix — the round-7 pack gate did its job *too* literally, and two releases paid for it. The v0.5.8 and v0.5.9 GitHub releases were created, but their publish runs failed the suite step and **never reached npm** (the registry stayed at 0.5.7); this entry exists so the gap is explained in the record rather than discovered. This release supersedes both on npm; their GitHub release notes carry a pointer here.
+
+- **Root cause: the pack-manifest parser assumed one npm major's output shape** — `scripts/check-pack.mjs` parsed `npm pack --dry-run --json` as a JSON array (`parsed[0]`). The publish workflow installs `npm@latest` before running the suite (required for Trusted Publishing), and npm 12 changed the output to an object keyed by package name — so the parse produced `undefined` and the check threw. Local development ran npm 10/11, where the array shape still holds, so nothing failed until the runner's npm 12 met the new gate. The gate blocking the publish was the design working; the parser's single-shape assumption was the bug.
+- **The fix: shape-tolerant parsing with verification** — the parser now accepts the array form (npm ≤ 11), a bare result object, or the name-keyed object (npm 12), and refuses (exit 2, "manifest NOT verified") if none of them yields a result with a real `files` array. Verified against live output from npm 10, 11, and 12 — all three parse to the same 22-file manifest. The check's assertions are unchanged.
+- **What did *not* change** — no runtime code, no API, no behavior: `src/` differs from 0.5.9 only in the version constant. The 0.5.8 (supply-chain) and 0.5.9 (final sweep) work ships to npm for the first time in this version, on top of everything those entries describe.
+- **Tests** — main suite **71 checks**, serverless **12**, both demos green, pack gate green under three npm majors.
+
 ## 0.5.9 — 2026-10-11
 
 Security hardening, round 8 (final) — the fresh-eyes sweep. Rounds 1–7 each hardened one surface; this round re-audited the *whole* surface as if none of them had happened — every route in the HTTP handler, the hosted router, and the serverless lib re-read side by side, hunting for the parity lesson (a check one surface has and another forgot), an unhandled await that can 500 or hang, and any place a round 2–6 invariant silently doesn't hold — and then re-ran the accumulated hostile-input battery against the current code on all five surfaces. The honest headline: **no new vulnerability was found and no runtime code changed.** What this round ships is the regression evidence, the consolidated posture document, and three stale claims corrected.

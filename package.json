@@ -46,5 +46,5 @@
     "hosted": "node src/hosted-server.mjs"
   },
   "type": "module",
-  "version": "0.5.9"
+  "version": "0.5.10"
 }

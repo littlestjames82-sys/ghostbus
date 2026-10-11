@@ -1,7 +1,7 @@
 # GhostBus security posture
 
 This document is the consolidated security posture of GhostBus as of
-**v0.5.9**: the architecture and its trust boundaries, the controls in
+**v0.5.10**: the architecture and its trust boundaries, the controls in
 place (grouped by family, with the hardening round that introduced
 each), the measured load evidence with its honest ceiling, and the
 known limitations — stated, not hidden.

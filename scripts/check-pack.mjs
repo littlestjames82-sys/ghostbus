@@ -81,8 +81,22 @@ if (res.error || res.status !== 0) {
 
 let pack;
 try {
-  pack = JSON.parse(res.stdout)[0];
+  const parsed = JSON.parse(res.stdout);
+  // npm <= 11 prints a JSON array of pack results; npm 12 prints an
+  // object keyed by package name. Accept either (plus a bare object),
+  // and verify the shape before trusting it — a parser that assumes one
+  // npm major's output shape is exactly how this gate broke under
+  // npm 12 in the v0.5.8/v0.5.9 publish runs (they were blocked, as
+  // designed, but for the wrong reason).
+  pack = Array.isArray(parsed)
+    ? parsed[0]
+    : (parsed && Array.isArray(parsed.files))
+      ? parsed
+      : Object.values(parsed ?? {}).find(v => v && Array.isArray(v.files));
 } catch {
+  pack = undefined;
+}
+if (!pack || !Array.isArray(pack.files)) {
   console.error('check-pack: could not parse `npm pack --dry-run --json` output — manifest NOT verified');
   process.exit(2);
 }

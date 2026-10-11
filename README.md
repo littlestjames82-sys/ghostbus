@@ -12,7 +12,7 @@ Zero dependencies. Node 20+. MIT.
 npm install ghostbus
 ```
 
-GhostBus is published on npm as [`ghostbus`](https://www.npmjs.com/package/ghostbus) (v0.5.9) — zero dependencies, Node 20+. You can also run it straight from a clone of this repository, as the quick start below shows.
+GhostBus is published on npm as [`ghostbus`](https://www.npmjs.com/package/ghostbus) (v0.5.10) — zero dependencies, Node 20+. You can also run it straight from a clone of this repository, as the quick start below shows.
 
 ## Status
 

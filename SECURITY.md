@@ -118,6 +118,11 @@ How the package you install is produced, and how to check it yourself:
   test suite and as a gate in the publish workflow. `SECURITY.md`
   itself ships in the tarball so this page travels with the code.
 
+The consolidated posture document — architecture and trust
+boundaries, every control family with its evidence, measured load
+limits, and the known limitations stated plainly — is
+[`docs/security.md`](docs/security.md); it ships in the tarball too.
+
 ## Scope notes
 
 - Self-hosted deployments are operated by whoever runs them; the operator

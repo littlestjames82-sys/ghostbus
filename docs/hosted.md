@@ -18,7 +18,7 @@ Data layout in the data dir: `registry.json` (workspace metadata + key **hashes*
 # create a workspace (returns its key ONCE)
 curl -X POST localhost:8388/api/workspaces -H 'x-bus-key: <admin>' \
   -d '{"id":"acme", "name":"Acme Team"}'
-# -> {"id":"acme","name":"Acme Team","key":"<64 hex>","keyNote":"..."}
+# -> {"id":"acme","name":"Acme Team","key":"<48 hex>","keyNote":"..."}
 curl localhost:8388/api/workspaces -H 'x-bus-key: <admin>'        # list + counts
 curl -X DELETE localhost:8388/api/workspaces/acme -H 'x-bus-key: <admin>'
 ```

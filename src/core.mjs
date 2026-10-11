@@ -14,7 +14,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 
-export const GHOSTBUS_VERSION = '0.5.8';
+export const GHOSTBUS_VERSION = '0.5.9';
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 // Timing-safe equality for hex digests (v0.5.3): secret comparisons must not
 // short-circuit on the first differing character the way === does.

@@ -57,6 +57,7 @@ const REQUIRED = [
   'README.md',
   'LICENSE',
   'SECURITY.md',
+  'docs/security.md',
   'src/core.mjs',
   'src/mcp-server.mjs',
   'src/cli.mjs',

@@ -33,7 +33,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const ADMIN_KEY = 'bench-admin-secret-0123456789';
+const ADMIN_KEY = 'bench-admin-key-not-a-real-secret'; // bench-only placeholder: set as GHOSTBUS_ADMIN_KEY for the throwaway server this script spawns, never a live key
 
 const pct = (arr, p) => {
   if (!arr.length) return 0;

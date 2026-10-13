@@ -104,7 +104,7 @@ await check('parity: rotate-key exists — the old workspace key dies at once, t
 });
 const map2 = new Map();
 const kv2 = { get: async (k) => map2.get(k) ?? null, set: async (k, v) => { map2.set(k, v); }, delete: async (k) => { map2.delete(k); } };
-const ADMIN2 = 'second-admin-key-012345';
+const ADMIN2 = 'test-admin-key-two-not-a-real-secret'; // local test placeholder only (>= 16 chars floor)
 const handle2 = createHostedCore({ kv: kv2, adminKey: ADMIN2 }); // requireTokens NOT passed — the default is the thing under test
 const call2 = (method, path, { key, body } = {}) => handle2(new Request(`http://test${path}`, {
   method,

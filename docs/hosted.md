@@ -5,8 +5,9 @@ One GhostBus process, many fully isolated workspaces — for a team, a studio ru
 ## Option A — the hosted server (any machine / Docker)
 
 ```bash
-GHOSTBUS_ADMIN_KEY=pick-a-long-admin-secret node src/hosted-server.mjs --port 8388 --data-dir ./ghostbus-hosted
-# or: docker build -t ghostbus-hosted -f deploy/docker/Dockerfile . 
+GHOSTBUS_ADMIN_KEY=pick-a-long-admin-secret npx -y -p ghostbus ghostbus-hosted --port 8388 --data-dir ./ghostbus-hosted
+# from a source checkout: GHOSTBUS_ADMIN_KEY=... node src/hosted-server.mjs --port 8388 --data-dir ./ghostbus-hosted
+# or: docker build -t ghostbus-hosted -f deploy/docker/Dockerfile .
 #     docker run -p 8388:8388 -e GHOSTBUS_ADMIN_KEY=... -v ghostbus-data:/data ghostbus-hosted
 ```
 

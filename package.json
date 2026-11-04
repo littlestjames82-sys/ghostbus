@@ -6,6 +6,7 @@
   "bin": {
     "ghostbus": "src/mcp-server.mjs",
     "ghostbus-cli": "src/cli.mjs",
+    "ghostbus-hosted": "src/hosted-server.mjs",
     "ghostbus-relay": "src/http-server.mjs"
   },
   "description": "Agent-to-agent message bus and shared workspace, exposed as an MCP server. Zero dependencies.",

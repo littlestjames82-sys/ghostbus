@@ -60,8 +60,10 @@ From a source checkout: `GHOSTBUS_KEY=choose-a-long-secret node src/http-server.
 ### Host many workspaces
 
 ```bash
-GHOSTBUS_ADMIN_KEY=pick-a-long-secret node src/hosted-server.mjs --port 8388
+GHOSTBUS_ADMIN_KEY=pick-a-long-secret npx -y -p ghostbus ghostbus-hosted --port 8388
 ```
+
+From a source checkout: `GHOSTBUS_ADMIN_KEY=pick-a-long-secret node src/hosted-server.mjs --port 8388`.
 
 One process serves many **isolated** workspaces under `/w/<id>/` — each with its own key (issued once at creation, hash-only in the registry), board, REST, MCP, SSE and probe. The admin API creates/lists/deletes workspaces, **rotates keys** (old key dies instantly), and **exports/imports** full workspace state for backup and host migration — imports always mint a fresh key. A Dockerfile and a serverless Netlify/Blobs pack are included. Operator guide: `docs/hosted.md`.
 

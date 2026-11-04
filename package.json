@@ -34,6 +34,7 @@
     "agent-to-agent"
   ],
   "license": "MIT",
+  "mcpName": "io.github.littlestjames82-sys/ghostbus",
   "name": "ghostbus",
   "repository": {
     "type": "git",
@@ -50,5 +51,5 @@
     "hosted": "node src/hosted-server.mjs"
   },
   "type": "module",
-  "version": "0.5.10"
+  "version": "0.5.11"
 }

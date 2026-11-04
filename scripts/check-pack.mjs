@@ -30,6 +30,7 @@ const ALLOWED_TOP = new Set([
   'LICENSE',
   'CHANGELOG.md',
   'PLAN.md',
+  'ROADMAP.md',
   'SECURITY.md',
   'src',
   'docs',

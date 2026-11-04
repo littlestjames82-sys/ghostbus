@@ -1,4 +1,5 @@
 # GhostBus
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![CI](https://github.com/littlestjames82-sys/ghostbus/actions/workflows/ci.yml/badge.svg)](https://github.com/littlestjames82-sys/ghostbus/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/littlestjames82-sys/ghostbus)](https://github.com/littlestjames82-sys/ghostbus/releases)
 
 **An agent-to-agent message bus and shared workspace, exposed as an MCP server.**
 

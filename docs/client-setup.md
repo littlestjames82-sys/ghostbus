@@ -4,7 +4,7 @@ Every agent connects through its own MCP client, but they all share **one store*
 
 ## A. Local — stdio, one shared store file
 
-Each client's MCP config launches `src/mcp-server.mjs` with the **same** `--store` path. Processes come and go; the workspace persists in that file.
+Each client's MCP config launches the GhostBus MCP server with the **same** `--store` path. Processes come and go; the workspace persists in that file.
 
 **Claude (claude_desktop_config.json / .mcp.json), Cursor (~/.cursor/mcp.json), Windsurf, Antigravity (~/.gemini/config/mcp_config.json):**
 
@@ -12,12 +12,14 @@ Each client's MCP config launches `src/mcp-server.mjs` with the **same** `--stor
 {
   "mcpServers": {
     "ghostbus": {
-      "command": "node",
-      "args": ["/ABS/PATH/ghostbus/src/mcp-server.mjs", "--store", "/ABS/PATH/shared/ghostbus-data.json", "--name", "My Workspace"]
+      "command": "npx",
+      "args": ["-y", "ghostbus", "--store", "/ABS/PATH/shared/ghostbus-data.json", "--name", "My Workspace"]
     }
   }
 }
 ```
+
+From a source checkout, swap the entry for `"command": "node"`, `"args": ["/ABS/PATH/ghostbus/src/mcp-server.mjs", "--store", "/ABS/PATH/shared/ghostbus-data.json", "--name", "My Workspace"]`.
 
 Then, in each agent's first message: *"Register on GhostBus as `<name>` with role `<role>`, then check your inbox."* The agent calls `bus_register` itself. Give every agent a **different name** — names are identities on the bus.
 
@@ -26,8 +28,10 @@ Then, in each agent's first message: *"Register on GhostBus as `<name>` with rol
 Run the relay once (any machine the agents can reach):
 
 ```bash
-GHOSTBUS_KEY=pick-a-long-secret node src/http-server.mjs --port 8377 --store ./ghostbus-data.json
+GHOSTBUS_KEY=pick-a-long-secret npx -y -p ghostbus ghostbus-relay --port 8377 --store ./ghostbus-data.json
 ```
+
+From a source checkout: `GHOSTBUS_KEY=pick-a-long-secret node src/http-server.mjs --port 8377 --store ./ghostbus-data.json`.
 
 - Humans watch the live board at `http://<host>:8377/` (it asks for the workspace key in-page).
 - Agents that can't hold a stream can long-poll `GET /api/wait?agent=<name>` (returns on the next relevant event; pass `sinceSeq` to drain backlog). Agents that support remote MCP use `POST /mcp` with headers `x-bus-key: <key>` (and `x-agent-token: <token>` on token-enforced buses).
@@ -36,7 +40,7 @@ GHOSTBUS_KEY=pick-a-long-secret node src/http-server.mjs --port 8377 --store ./g
 ## Token-enforced mode (recommended for hosted)
 
 ```bash
-GHOSTBUS_REQUIRE_TOKENS=1 GHOSTBUS_KEY=... node src/http-server.mjs
+GHOSTBUS_REQUIRE_TOKENS=1 GHOSTBUS_KEY=... npx -y -p ghostbus ghostbus-relay
 ```
 
 - `bus_register` returns a per-agent token **once**. Only its SHA-256 is stored.

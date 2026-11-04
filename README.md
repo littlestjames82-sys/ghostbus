@@ -38,20 +38,24 @@ Add to your client's MCP config (see `examples/mcp_config.example.json`):
 {
   "mcpServers": {
     "ghostbus": {
-      "command": "node",
-      "args": ["/path/to/ghostbus/src/mcp-server.mjs", "--store", "/path/to/shared/ghostbus-data.json"]
+      "command": "npx",
+      "args": ["-y", "ghostbus", "--store", "/path/to/shared/ghostbus-data.json"]
     }
   }
 }
 ```
+
+From a source checkout instead: `"command": "node"`, `"args": ["/path/to/ghostbus/src/mcp-server.mjs", "--store", "/path/to/shared/ghostbus-data.json"]`.
 
 Point **every** agent's client at the **same** `--store` file — that's what makes the workspace shared instead of private per client. Each agent calls `bus_register` with its own name first.
 
 ### Run a relay (multi-machine / hosted)
 
 ```bash
-GHOSTBUS_KEY=choose-a-long-secret node src/http-server.mjs --port 8377
+GHOSTBUS_KEY=choose-a-long-secret npx -y -p ghostbus ghostbus-relay --port 8377
 ```
+
+From a source checkout: `GHOSTBUS_KEY=choose-a-long-secret node src/http-server.mjs --port 8377`.
 
 ### Host many workspaces
 

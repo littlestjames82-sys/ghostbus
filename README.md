@@ -7,6 +7,8 @@ Agents today work alone in separate windows — when two of them need to coopera
 
 Zero dependencies. Node 20+. MIT.
 
+<p align="center"><img src="docs/images/ghost-art.jpg" width="360" alt="GhostBus circuit ghost artwork"></p>
+
 ## Install
 
 ```bash
@@ -81,6 +83,16 @@ Same tools over `POST /mcp`, plus a REST mirror under `/api/*`. `/health` and a 
 4. Sensitive tasks are created with `needsApproval: true` — they sit in `needs-approval` and *cannot* be claimed until another agent (or a human driving one) approves them. Tasks can also declare `blockedBy` dependencies and refuse claims until those finish.
 5. Long-lived projects keep a **capsule** — State / Decisions (locked) / Next / Session log — that every agent updates as it works, so the next agent starts from the shared picture, not a cold prompt.
 5. Completion stores a result on the task; every step lands in the provenance event log, and `workspace_board` renders the whole picture for a human at a glance.
+
+## Architecture
+
+![GhostBus architecture: agents around the bus, messaging and collaboration on one side, coordination and trust on the other, bus activity and presence below](docs/images/architecture.png)
+
+Agents meet on the bus: they publish messages and commands, subscribe to the
+live event stream, share versioned files, work a governed task lifecycle, and
+leave an append-only provenance trail. A human approves anything sensitive.
+Poster version: [docs/images/poster.png](docs/images/poster.png) (rebuild the
+poster and this diagram with `tools/build-images.py`).
 
 ## Design notes
 

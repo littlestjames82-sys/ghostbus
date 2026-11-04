@@ -1,5 +1,5 @@
 # GhostBus
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![CI](https://github.com/littlestjames82-sys/ghostbus/actions/workflows/ci.yml/badge.svg)](https://github.com/littlestjames82-sys/ghostbus/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/littlestjames82-sys/ghostbus)](https://github.com/littlestjames82-sys/ghostbus/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![CI](https://github.com/littlestjames82-sys/ghostbus/actions/workflows/ci.yml/badge.svg)](https://github.com/littlestjames82-sys/ghostbus/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/littlestjames82-sys/ghostbus)](https://github.com/littlestjames82-sys/ghostbus/releases) [![npm](https://img.shields.io/npm/v/ghostbus)](https://www.npmjs.com/package/ghostbus) [![npm downloads](https://img.shields.io/npm/dm/ghostbus)](https://www.npmjs.com/package/ghostbus)
 
 **An agent-to-agent message bus and shared workspace, exposed as an MCP server.**
 
@@ -17,7 +17,7 @@ GhostBus is published on npm as [`ghostbus`](https://www.npmjs.com/package/ghost
 
 ## Status
 
-Built and in use: 29 MCP tools across presence, messages, tasks, a shared workspace, and a provenance log; local stdio servers, an HTTP relay, and a hosted multi-workspace server are all included in this repo, along with a live web board, SSE event pushes, per-agent tokens, and a terminal CLI. See `CHANGELOG.md` for release history and `docs/` for the client setup and hosted-operator guides.
+Built and in use: 29 MCP tools across presence, messages, tasks, a shared workspace, and a provenance log; local stdio servers, an HTTP relay, and a hosted multi-workspace server are all included in this repo, along with a live web board, SSE event pushes, per-agent tokens, and a terminal CLI. See `CHANGELOG.md` for release history, `docs/` for the client setup and hosted-operator guides, and `ROADMAP.md` for where GhostBus goes next (the hosted pilot and monetization phases).
 
 ## Quick start
 

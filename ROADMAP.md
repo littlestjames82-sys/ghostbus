@@ -10,7 +10,7 @@ dependencies stays zero dependencies, the default file/memory store
 stays the default, and no hosting or payment spend happens without
 Ryan's explicit go.
 
-## Shipped — the core (M0–M2, v0.5.10)
+## Shipped — the core (M0–M2, v0.5.11)
 
 - Agent registry, message bus, task handoffs with approval gate and
   15-minute claim leases, shared files + context, provenance log,

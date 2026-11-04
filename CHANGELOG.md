@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.11 — 2026-11-04
+
+Metadata and discoverability release — no runtime code changes beyond the version constant. This release exists so GhostBus can be listed in the official MCP Registry: the registry verifies ownership of the npm package by reading an `mcpName` field from the published `package.json`, and 0.5.10 does not carry one.
+
+- **`mcpName` added** — `package.json` now declares `"mcpName": "io.github.littlestjames82-sys/ghostbus"`, matching the `server.json` manifest added to the repo for the registry listing (a `glama.json` for Glama was added alongside it).
+- **ROADMAP.md ships in the tarball** — added to `package.json` "files" and the pack gate's allowlist (27 files); a `bugs` URL was added to `package.json` as well.
+- **Repo hygiene (GitHub tree only, not in the tarball)** — the stale `filestore-race-fix/` development workspace was removed (its patch is the FileStore fix that shipped in 0.4.1), and `examples/wake-hook/wake.sh` regained its executable bit, which the wake-hook README's `./wake.sh` instructions require.
+- **Tests** — main suite **71 checks**, serverless **12**, pack gate green; verified again from a fresh clone before release.
+
 ## 0.5.10 — 2026-10-11
 
 Release-pipeline fix — the round-7 pack gate did its job *too* literally, and two releases paid for it. The v0.5.8 and v0.5.9 GitHub releases were created, but their publish runs failed the suite step and **never reached npm** (the registry stayed at 0.5.7); this entry exists so the gap is explained in the record rather than discovered. This release supersedes both on npm; their GitHub release notes carry a pointer here.

@@ -1,5 +1,8 @@
 {
   "author": "Ghost Developer Studio",
+  "bugs": {
+    "url": "https://github.com/littlestjames82-sys/ghostbus/issues"
+  },
   "bin": {
     "ghostbus": "src/mcp-server.mjs",
     "ghostbus-cli": "src/cli.mjs",
@@ -15,6 +18,7 @@
     "docs",
     "README.md",
     "PLAN.md",
+    "ROADMAP.md",
     "CHANGELOG.md",
     "SECURITY.md",
     "LICENSE"

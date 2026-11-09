@@ -48,6 +48,105 @@ Add to your client's MCP config (see `examples/mcp_config.example.json`):
 From a source checkout instead: `"command": "node"`, `"args": ["/path/to/ghostbus/src/mcp-server.mjs", "--store", "/path/to/shared/ghostbus-data.json"]`.
 
 Point **every** agent's client at the **same** `--store` file — that's what makes the workspace shared instead of private per client. Each agent calls `bus_register` with its own name first.
+### Install in your client
+
+The block above is the generic form. Here is the same server, with the same command and the same `--store` argument, in the exact config shape each client expects. Point every client at the same `--store` file so all your agents share one workspace.
+
+**Claude Desktop** (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "ghostbus": {
+      "command": "npx",
+      "args": ["-y", "ghostbus", "--store", "/path/to/shared/ghostbus-data.json"]
+    }
+  }
+}
+```
+
+**Claude Code** (from a terminal):
+
+```bash
+claude mcp add ghostbus -- npx -y ghostbus --store /path/to/shared/ghostbus-data.json
+```
+
+**Cursor** (`.cursor/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "ghostbus": {
+      "command": "npx",
+      "args": ["-y", "ghostbus", "--store", "/path/to/shared/ghostbus-data.json"]
+    }
+  }
+}
+```
+
+**VS Code** (`.vscode/mcp.json`):
+
+```json
+{
+  "servers": {
+    "ghostbus": {
+      "command": "npx",
+      "args": ["-y", "ghostbus", "--store", "/path/to/shared/ghostbus-data.json"]
+    }
+  }
+}
+```
+
+**Cline** (`cline_mcp_settings.json`):
+
+```json
+{
+  "mcpServers": {
+    "ghostbus": {
+      "command": "npx",
+      "args": ["-y", "ghostbus", "--store", "/path/to/shared/ghostbus-data.json"]
+    }
+  }
+}
+```
+
+**Codex** (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.ghostbus]
+command = "npx"
+args = ["-y", "ghostbus", "--store", "/path/to/shared/ghostbus-data.json"]
+```
+
+**Goose** (`~/.config/goose/config.yaml`):
+
+```yaml
+extensions:
+  ghostbus:
+    enabled: true
+    type: stdio
+    name: ghostbus
+    cmd: npx
+    args:
+      - "-y"
+      - ghostbus
+      - --store
+      - /path/to/shared/ghostbus-data.json
+```
+
+**Windsurf** (`~/.codeium/windsurf/mcp_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "ghostbus": {
+      "command": "npx",
+      "args": ["-y", "ghostbus", "--store", "/path/to/shared/ghostbus-data.json"]
+    }
+  }
+}
+```
+
 
 ### Run a relay (multi-machine / hosted)
 

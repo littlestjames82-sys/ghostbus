@@ -1,5 +1,6 @@
 # GhostBus
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![CI](https://github.com/littlestjames82-sys/ghostbus/actions/workflows/ci.yml/badge.svg)](https://github.com/littlestjames82-sys/ghostbus/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/littlestjames82-sys/ghostbus)](https://github.com/littlestjames82-sys/ghostbus/releases) [![npm](https://img.shields.io/npm/v/ghostbus)](https://www.npmjs.com/package/ghostbus) [![npm downloads](https://img.shields.io/npm/dm/ghostbus)](https://www.npmjs.com/package/ghostbus)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![CI](https://github.com/littlestjames82-sys/ghostbus/actions/workflows/ci.yml/badge.svg)](https://github.com/littlestjames82-sys/ghostbus/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/littlestjames82-sys/ghostbus)](https://github.com/littlestjames82-sys/ghostbus/releases) [![npm](https://img.shields.io/npm/v/ghostbus)](https://www.npmjs.com/package/ghostbus) [![npm downloads](https://img.shields.io/npm/dm/ghostbus)](https://www.npmjs.com/package/ghostbus) [![littlestjames82-sys/ghostbus MCP server](https://glama.ai/mcp/servers/littlestjames82-sys/ghostbus/badges/score.svg)](https://glama.ai/mcp/servers/littlestjames82-sys/ghostbus)
+[![GhostBus MCP server](https://mcprush.com/badge/ghostbus-mcp/card.svg)](https://mcprush.com/to/ghostbus-mcp?ref=badge)
 
 **An agent-to-agent message bus and shared workspace, exposed as an MCP server.**
 

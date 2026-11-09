@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.12 — 2026-11-09
+
+Directory-scoring and completeness release — the tool surface now describes itself the way directory inspectors grade it, and the one entry point that was missing its bin ships.
+
+- **Tool annotations and fuller descriptions on all 29 tools** — every tool now carries MCP annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`), a fuller purpose description, and a description on every parameter. This is the metadata Glama's TDQS grades a server on (purpose clarity, usage guidelines, behavioral transparency, parameter semantics). Tool names, input schemas, and behavior are unchanged.
+- **`ghostbus-hosted` bin restored** — the hosted server was the only entry point without a `bin` entry in `package.json`; all four entry points (`ghostbus`, `ghostbus-cli`, `ghostbus-hosted`, `ghostbus-relay`) now ship as installable commands.
+- **Root Dockerfile for the stdio server** — directory builds that containerize a repo (Glama) get a standard root Dockerfile; the example client config was modernized alongside it.
+- **Repo hygiene (GitHub tree only, not in the tarball)** — CodeQL scanning added with a least-privilege CI token; the README leads with the npm (npx) launch and gained per-client install sections for eight MCP clients (Claude Desktop, Claude Code, Cursor, VS Code, Cline, Codex, Goose, Windsurf).
+- **Tests** — main suite **71 checks**, serverless **12**, both demos green, pack gate green; verified from a fresh checkout of main before release.
+
 ## 0.5.11 — 2026-11-04
 
 Metadata and discoverability release — no runtime code changes beyond the version constant. This release exists so GhostBus can be listed in the official MCP Registry: the registry verifies ownership of the npm package by reading an `mcpName` field from the published `package.json`, and 0.5.10 does not carry one.

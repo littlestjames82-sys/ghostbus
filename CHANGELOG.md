@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.7.0 — 2026-11-26
+
+The production-scale release for the hosted relay: persistence stops being the bottleneck. **Upgrade notes:** the hosted server's on-disk layout gains one file per workspace (`<id>.json.journal` next to the existing `<id>.json` snapshot — back up both; the snapshot alone is a valid but possibly stale state). Existing data directories migrate in place with no conversion: the old state file is a valid snapshot as-is. The hosted process now OWNS its data directory — edits made to workspace files behind a running server's back are no longer picked up until restart (the CLI import path is unaffected; it runs against a stopped server or its own store file). Local transports (stdio, CLI, single-workspace relay) are unchanged and still share store files between processes exactly as before.
+
+### Performance
+- **New `JournalStore` backs the hosted server.** State loads once per workspace; each save appends one checksummed delta record (added/patched/removed items by identity, changed scalars, file put/del) to `<id>.json.journal` instead of re-reading, re-parsing and rewriting the whole state file. The journal compacts back into the snapshot at ~1 MB or ~1000 records. Per-operation cost is O(change size), not O(state size).
+- **Measured on a shared VM (Node 24, 1.5 shared CPUs), same bench, same day:** 25 agents × 30 s went from ~123 ops/s (v0.6.0 store) to ~310 ops/s, 0 errors, exact reconciliation, with the workspace growing to ~2.2 MB mid-run; 50 agents land at the same ~303 ops/s — the ceiling is now per-workspace serialization on one thread. In-process at ~1.2 MB of state: ~16.7 ms → ~3.5 ms per message send. Full table in `docs/hosted.md`.
+- **The core reports which sections each operation touched** (`GhostBus._touch`, passed to stores as a save hint), and the journal store diffs only those sections against a per-section JSON cache. Every 200 saves the hint is ignored and everything is diffed, so a missed hint self-corrects; restore always diffs in full. Events take a shape-checked append/trim fast path in hinted saves.
+
+### Durability & correctness
+- **Journal replay is prefix-exact:** records carry generation numbers and checksums; replay stops at the first torn, gapped or corrupt record (a crash mid-append costs at most the in-flight operation) and the store compacts to heal the tail on load. A crash between snapshot and journal renames during compaction is safe — replay skips records already folded into the snapshot by generation. The suite's SIGKILL recovery drill now asserts against the replayed durable state.
+- **Corrupt snapshots fail loud**, exactly like FileStore (`STORE_CORRUPT` / `STORE_UNREADABLE`, file left untouched); a journal with records but no snapshot is refused, never silently reset.
+- **`GHOSTBUS_JOURNAL_FSYNC=1`** fsyncs each journal append for power-loss durability (one fsync per save). Default posture matches FileStore's: process-kill durable, not power-loss durable.
+- **Registry freshness:** the hosted router re-reads the (tiny) registry when resolving a workspace, so a rotated key dies immediately in the serving process and a deleted workspace stops resolving at once — no restart, no stale cached meta.
+- Workspace delete and import now also remove/ignore a stale `<id>.json.journal`, so a previous life of a workspace id can never replay its deltas onto a new workspace.
+
+### Tests
+- Suite 81 → 84 checks: JournalStore round-trip exactness across every mutating operation (deep-equal snapshots after reload), torn-tail healing, corrupt-snapshot refusal, in-place FileStore migration, and forced-compaction correctness. Serverless pack unchanged at 12 checks. Pack manifest gate unchanged.
+
 ## 0.6.0 — 2026-11-25
 
 Review-driven release: one confidentiality fix, one data-loss fix, quotas, accurate HTTP statuses, token hygiene, and the fixes from the brief. The MCP tool surface only gains optional parameters; **the behavior changes are listed under "Upgrade notes" — read them before deploying.** This release folds in the earlier 0.5.12 work (priority validation and caps), which was never published.

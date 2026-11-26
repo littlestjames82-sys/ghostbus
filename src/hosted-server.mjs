@@ -36,12 +36,18 @@
  *   just MCP) and the serverless pack was realigned with this server —
  *   enforcement default, admin-key floor, rotate/export/import. See
  *   SECURITY.md ("Credential lifecycle") and docs/hosted.md round 6.
+ * - v0.7.0: workspaces run on JournalStore (snapshot + delta journal —
+ *   see core.mjs), and workspace resolution re-reads the registry every
+ *   time, so key rotation and deletion take effect in the serving
+ *   process immediately. The hosted process owns its data directory:
+ *   workspace files edited behind its back are not picked up until
+ *   restart.
  */
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { createBus, FileStore, GHOSTBUS_VERSION, validateSnapshot } from './core.mjs';
+import { createBus, JournalStore, GHOSTBUS_VERSION, validateSnapshot } from './core.mjs';
 import { createBusHandler, clientIp, keyMatches, hashMatches, readJsonBody, MAX_BODY_BYTES, HTML_SECURITY_HEADERS, applyServerTimeouts, SERVER_TIMEOUT_DEFAULTS } from './handler.mjs';
 
 const argv = process.argv.slice(2);
@@ -109,11 +115,18 @@ const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex'
 const buses = new Map(); // id -> {bus, handle}
 async function getWorkspace(id) {
   if (!validId(id)) return null; // an id is a file name inside dataDir — nothing else resolves (v0.5.4)
-  if (buses.has(id)) return buses.get(id);
+  // The registry is re-read on every resolution (v0.7.0): it is tiny, and
+  // a cached meta would keep a rotated workspace key alive in this
+  // process until restart — rotation must kill the old key immediately,
+  // and a deleted workspace must stop resolving at once.
   const reg = loadRegistry();
   const meta = reg.workspaces[id];
-  if (!meta) return null;
-  const bus = await createBus(new FileStore(path.join(dataDir, `${id}.json`)), { id, name: meta.name }, { requireTokens: REQUIRE_TOKENS });
+  if (!meta) { buses.delete(id); handlers.delete(id); return null; }
+  if (buses.has(id)) { const entry = buses.get(id); entry.meta = meta; return entry; }
+  // JournalStore (v0.7.0): the hosted process owns each workspace, so the
+  // store loads once and journals deltas instead of re-reading and
+  // rewriting the whole state file per operation (see core.mjs).
+  const bus = await createBus(new JournalStore(path.join(dataDir, `${id}.json`)), { id, name: meta.name }, { requireTokens: REQUIRE_TOKENS });
   const entry = { bus, meta };
   buses.set(id, entry);
   return entry;
@@ -293,6 +306,10 @@ const server = http.createServer(async (req, res) => {
       fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 }); // state file: owner-only (v0.5.3)
       try { fs.chmodSync(tmp, 0o600); } catch { /* mode already applied on create */ }
       fs.renameSync(tmp, file);
+      // The imported file is a JournalStore snapshot at generation 0; a
+      // stale journal from a previous life of this id must never replay
+      // its deltas onto the imported state (v0.7.0).
+      try { fs.unlinkSync(file + '.journal'); } catch {}
       audit('import', id, req);
       const w = await getWorkspace(id);
       const status = await w.bus.status();
@@ -308,6 +325,7 @@ const server = http.createServer(async (req, res) => {
       saveRegistry(reg);
       buses.delete(id); handlers.delete(id);
       try { fs.unlinkSync(path.join(dataDir, `${id}.json`)); } catch {}
+      try { fs.unlinkSync(path.join(dataDir, `${id}.json.journal`)); } catch {} // JournalStore delta log (v0.7.0)
       audit('delete', id, req);
       return send(200, { id, deleted: true });
     }

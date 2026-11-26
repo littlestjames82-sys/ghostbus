@@ -170,7 +170,8 @@ export async function runBench({ agents: agentCount = 25, seconds = 30, port = 1
     const files = (await call(bootAgent, 'GET', `${W}/api/files/list`, { key: wsKey })).json;
     clearInterval(rssTimer);
     const rssAfter = rssMB(proc.pid);
-    const stateBytes = fs.statSync(path.join(dataDir, 'bench.json')).size;
+    // v0.7.0: workspace storage is a snapshot plus a delta journal.
+    const stateBytes = ['bench.json', 'bench.json.journal'].reduce((n, f) => { try { return n + fs.statSync(path.join(dataDir, f)).size; } catch { return n; } }, 0);
     const mismatches = [];
     if (!status) mismatches.push('status unreadable at end of run');
     else {

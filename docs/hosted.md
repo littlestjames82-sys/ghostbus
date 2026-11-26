@@ -11,7 +11,7 @@ GHOSTBUS_ADMIN_KEY=pick-a-long-admin-secret npx -y -p ghostbus ghostbus-hosted -
 #     docker run -p 8388:8388 -e GHOSTBUS_ADMIN_KEY=... -v ghostbus-data:/data ghostbus-hosted
 ```
 
-Data layout in the data dir: `registry.json` (workspace metadata + key **hashes**) and one `<id>.json` state file per workspace. Back up the directory and you've backed up everything.
+Data layout in the data dir: `registry.json` (workspace metadata + key **hashes**) and, per workspace, an `<id>.json` state snapshot plus an `<id>.json.journal` delta log (v0.7.0: the hosted store loads the snapshot once and appends per-change records to the journal, compacting the journal back into the snapshot as it grows). Back up the directory and you've backed up everything.
 
 ### Operator flow
 
@@ -115,7 +115,7 @@ the operator, so its defaults are stricter than the local relay's (v0.5.2):
   leaks, rotate it — `POST /api/workspaces/<id>/rotate-key` kills the old
   key immediately (see above).
 - **Backups are a schedule, not a feature.** The data dir *is* the state
-  (`registry.json` + one `<id>.json` per workspace), so back it up on a
+  (`registry.json` + one `<id>.json` snapshot and `<id>.json.journal` per workspace), so back it up on a
   timer, and per-workspace exports give you portable copies:
   ```bash
   # nightly, e.g. from cron — plus a plain copy of the data dir
@@ -244,50 +244,56 @@ serverless pack from drifting away from the rules above:
   pack since v0.5.7 — the same one-line JSON records, in the function
   log.
 
-## Capacity & limits (measured, v0.5.6)
+## Capacity & limits (measured, v0.7.0)
 
-First published load figures, from `scripts/load-bench.mjs` — a repeatable
-bench that boots the real hosted server (per-agent tokens enforced) and
-drives N agents through mixed register/heartbeat/send/inbox/task/file
-operations, then reconciles the final state **exactly** (messages sent ==
-messages stored, tasks created == tasks completed, files put == files
-stored). One development machine (Node 24, local disk); treat these as
-evidence about the shape of the limits, not as a hosted SLA.
+Load figures from `scripts/load-bench.mjs` — a repeatable bench that
+boots the real hosted server (per-agent tokens enforced) and drives N
+agents through mixed register/heartbeat/send/inbox/task/file operations,
+then reconciles the final state **exactly** (messages sent == messages
+stored, tasks created == tasks completed, files put == files stored).
+Measured on a shared development VM (Node 24, 1.5 shared CPUs, local
+disk); treat these as evidence about the shape of the limits, not as a
+hosted SLA.
 
-| run | ops | throughput | errors | latency (p50 / p95) |
+| run | ops | throughput | errors | latency (p50 per op class) |
 |---|---|---|---|---|
-| 25 agents × 30 s | 2,506 | ~83 ops/s | 0 | ~280–360 ms / ~390–595 ms per op class |
-| 25 agents × 60 s | 3,438 | ~57 ops/s | 0 | ~315–470 ms / ~910–1,870 ms per op class |
+| 25 agents × 30 s — v0.6.0 store | 3,758 | ~123 ops/s | 0 | ~180–230 ms |
+| 25 agents × 30 s — v0.7.0 journal store | 9,400 | ~310 ops/s | 0 | ~40–110 ms |
+| 50 agents × 30 s — v0.7.0 journal store | 9,200 | ~303 ops/s | 0 | ~85–170 ms |
 
-Repeat runs vary with machine load — five 30 s runs on the shared
-development VM landed between ~55 and ~112 ops/s. What did not vary, in
-any run: **0 errors, and exact reconciliation.**
+What changed in v0.7.0: the hosted store no longer loads, parses and
+rewrites the whole state file per operation. State loads once; each save
+appends one delta record (the sections the operation actually touched)
+to `<id>.json.journal`, and the journal compacts back into the snapshot
+as it grows. Per-operation cost is now O(change size), not O(state
+size) — in the 25-agent run the workspace grew to ~2.2 MB of state
+during the run and throughput held, where the old store's per-op cost
+grew with every megabyte. An in-process micro-bench at ~1.2 MB of state
+tells the same story without HTTP in the way: ~16.7 ms per send on the
+old path, ~3.5 ms on the journal store.
 
 What the numbers mean:
 
 - **Correctness holds under concurrency.** Zero errors and exact
   reconciliation at every size — the per-workspace lock serializes
   operations, so nothing is lost or double-applied.
-- **Throughput is bounded by design, and declines as a workspace grows.**
-  Every operation loads and re-saves the workspace's whole state file, so
-  per-operation cost is O(state size), and operations queue behind each
-  other: with 25 agents active, most of the ~300 ms p50 is queue wait, not
-  work. The 60 s run is slower per op than the 30 s run because its state
-  file grew from ~0.9 MB to ~1.2 MB during the run. History trims (10k
-  messages, 5k events, per-file history) bound how large that cost can
-  get, but a hot workspace is a real cost center — split hot work into
-  more workspaces rather than feeding one forever.
+- **The remaining ceiling is serialization + one CPU thread.** At ~300
+  ops/s on this VM, 25 and 50 agents land in the same place: operations
+  on one workspace queue behind its lock, and the process is single-
+  threaded. Latency at depth is queue wait, not work. More workspaces
+  spread load across buses, but a single hot workspace tops out at what
+  one core serves; multi-process sharding is the known next step and is
+  deliberately not faked (see `docs/security.md`, known limitations).
 - **Memory plateaus.** Under sustained load the server's RSS climbed,
-  then oscillated in a ~140–260 MB band (garbage collection keeping up
-  with per-operation state copies). It did not grow linearly with the
-  operation count; no leak was found.
+  then oscillated in a ~190–250 MB band. It did not grow linearly with
+  the operation count; no leak was found.
 - **Durability under a hard kill is proven, not assumed.** The suite's
   recovery drill SIGKILLs the server mid-load and restarts on the same
-  data directory: the state file parses (writes are temp-file + atomic
-  rename, so a kill can strand at most an inert `.tmp` file), every
-  operation the server had already answered with HTTP 200 is present, and
-  each agent's stored messages form a contiguous prefix of what it
-  attempted — nothing half-applied.
+  data directory: the snapshot parses, journal replay stops at the
+  first torn record (a kill mid-append costs at most the in-flight
+  operation), every operation the server had already answered with
+  HTTP 200 is present, and each agent's stored messages form a
+  contiguous prefix of what it attempted — nothing half-applied.
 
 Abuse limits an operator can tune (environment variables):
 
@@ -306,12 +312,15 @@ Abuse limits an operator can tune (environment variables):
 | `GHOSTBUS_MAX_COMMENTS_PER_TASK` | 500 | comments per task → `507` |
 | `GHOSTBUS_MAX_FILE_BYTES` | 1000000 | one shared file's size → `413` |
 | `GHOSTBUS_MAX_CONTEXT_BYTES` | 262144 | published context size → `413` |
+| `GHOSTBUS_JOURNAL_FSYNC` | off | `1` fsyncs every journal append (hosted store): survives OS/power loss, at one fsync per save. Off = survives a process kill, the same posture FileStore always had (v0.7.0) |
 
 When to scale out: one process serving a handful of team-sized workspaces
-is the design point. If a single workspace's sustained op rate or state
-size becomes the bottleneck, the honest answer today is "more, smaller
-workspaces" — the networked multi-writer store that would lift the
-single-file ceiling is documented future work, not a flag you can flip.
+is the design point — v0.7.0's journal store raised the per-workspace
+ceiling ~2.5× and removed the state-size tax, but operations on one
+workspace still serialize on one core. If a single workspace's sustained
+op rate becomes the bottleneck, the honest answer today is "more,
+smaller workspaces" — multi-process sharding and the networked
+multi-writer store are documented future work, not flags you can flip.
 
 ## Option B — serverless on Netlify (Blobs)
 

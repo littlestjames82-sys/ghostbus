@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createBus, MemoryStore, FileStore, validateSnapshot } from './src/core.mjs';
+import { createBus, MemoryStore, FileStore, JournalStore, validateSnapshot } from './src/core.mjs';
 import { TOOLS, callTool } from './src/tools.mjs';
 
 let pass = 0, fail = 0;
@@ -730,8 +730,8 @@ await check('hosted hardening (v0.5.3): HTML pages carry CSP/frame headers, data
     assert.equal((await fetch('http://127.0.0.1:18388/w/vault/api/status', { headers: { 'x-bus-key': 'not-the-vault-key' } })).status, 401);
     const reg = await J(await fetch('http://127.0.0.1:18388/w/vault/api/agents', { method: 'POST', headers: K, body: JSON.stringify({ agent: 'vault-agent' }) }));
     await fetch('http://127.0.0.1:18388/w/vault/api/messages', { method: 'POST', headers: { ...K, 'x-agent-token': reg.token }, body: JSON.stringify({ agent: 'vault-agent', to: '*', body: 'perms probe' }) });
-    // registry + workspace state files are owner-only
-    for (const f of ['registry.json', 'vault.json']) {
+    // registry + workspace state files are owner-only (snapshot + journal)
+    for (const f of ['registry.json', 'vault.json', 'vault.json.journal']) {
       const mode = fs.statSync(path.join(dataDir, f)).mode & 0o777;
       assert.equal(mode, 0o600, `${f} must be 0600, got ${mode.toString(8)}`);
     }
@@ -1362,10 +1362,14 @@ await check('recovery drill (v0.5.6): SIGKILL mid-load, restart on the same data
     await waitUp();
     const status = await (await fetch('http://127.0.0.1:18414/w/drill/api/status', { headers: WK })).json();
     assert.equal(status.agents, 3);
-    // the state file itself must parse — the atomic rename means a kill can
-    // strand at most an orphaned .tmp, never a torn main file.
-    const state = JSON.parse(fs.readFileSync(path.join(dataDir, 'drill.json'), 'utf8'));
-    assert.equal(status.messages, state.messages.length, 'restarted server and state file disagree');
+    // the snapshot file itself must parse — the atomic rename means a kill
+    // can strand at most an orphaned .tmp, never a torn snapshot — and the
+    // durable state (snapshot + journal replay, v0.7.0) must agree with
+    // what the restarted server reports: replay stops at the first torn
+    // record, so a kill mid-append costs at most the in-flight operation.
+    JSON.parse(fs.readFileSync(path.join(dataDir, 'drill.json'), 'utf8'));
+    const state = await new JournalStore(path.join(dataDir, 'drill.json')).load();
+    assert.equal(status.messages, state.messages.length, 'restarted server and durable state disagree');
     for (const name of agents) {
       const stored = state.messages
         .filter(m => m.from === name && typeof m.body === 'string' && m.body.startsWith(`drill ${name} seq `))
@@ -1624,6 +1628,70 @@ await check('FileStore never replaces unreadable data with an empty workspace; c
   const b = await createBus(new FileStore(g)); await b.registerAgent({ name: 'z' });
   assert.ok(!fs.readFileSync(g, 'utf8').includes('\n'), 'state file is compact JSON');
   assert.equal((await createBus(new FileStore(g))).state.agents.length, 1, 'compact file round-trips');
+});
+
+/* ---------------- v0.7.0: JournalStore (production-scale hosted store) ---------------- */
+console.log('v0.7.0 journal store:');
+await check('JournalStore round-trips a busy workspace exactly (deltas, patches, file put/del, context)', async () => {
+  const f = path.join(tmp, 'journal.json');
+  const b = await createBus(new JournalStore(f), { name: 'Journal' });
+  await b.registerAgent({ name: 'j1', role: 'lead' });
+  await b.registerAgent({ name: 'j2', role: 'hand' });
+  for (let i = 0; i < 25; i++) await b.sendMessage({ from: 'j1', to: 'j2', body: `journal msg ${i}` });
+  const t = await b.createTask({ from: 'j1', title: 'journal task' });
+  await b.claimTask(t.id, { by: 'j2' });
+  await b.addTaskComment(t.id, { by: 'j1', body: 'a comment patch' });
+  await b.completeTask(t.id, { by: 'j2', result: 'ok' });
+  await b.putFile({ by: 'j1', path: 'a.txt', text: 'alpha' });
+  await b.putFile({ by: 'j1', path: 'b.txt', text: 'beta' });
+  await b.deleteFile({ by: 'j1', path: 'b.txt' });
+  await b.putContext({ by: 'j1', context: { phase: 'journal' } });
+  const before = await b.snapshot();
+  const b2 = await createBus(new JournalStore(f), { name: 'Journal' });
+  assert.deepEqual(await b2.snapshot(), before, 'reloaded state differs from live state');
+  // saves really are deltas: the journal holds records, the snapshot is a
+  // valid standalone state file, and neither contains the other's format.
+  const snap = JSON.parse(fs.readFileSync(f, 'utf8'));
+  assert.ok(Array.isArray(snap.agents), 'snapshot is a plain state file');
+  const journal = fs.readFileSync(f + '.journal', 'utf8').trim().split('\n').map(l => JSON.parse(l));
+  assert.ok(journal.length > 5 && journal.every(r => r.v === 1), 'journal is a record log');
+});
+
+await check('JournalStore: torn tail heals to the clean prefix; corrupt snapshot still fails loud', async () => {
+  const f = path.join(tmp, 'journal-torn.json');
+  const b = await createBus(new JournalStore(f), { name: 'Torn' });
+  await b.registerAgent({ name: 't1' });
+  await b.sendMessage({ from: 't1', to: '*', body: 'kept' });
+  fs.appendFileSync(f + '.journal', '{"gen":99,"s":{"seq":1'); // crash mid-append
+  const b2 = await createBus(new JournalStore(f), { name: 'Torn' });
+  assert.equal((await b2.status()).messages, 1, 'torn record must be dropped, prefix kept');
+  await b2.sendMessage({ from: 't1', to: '*', body: 'after heal' });
+  const b3 = await createBus(new JournalStore(f), { name: 'Torn' });
+  assert.equal((await b3.status()).messages, 2, 'writes after healing must be durable');
+  const g = path.join(tmp, 'journal-corrupt.json');
+  fs.writeFileSync(g, '{"agents": [ {truncated');
+  await assert.rejects(() => new JournalStore(g).load(), (er) => er.code === 'STORE_CORRUPT');
+});
+
+await check('JournalStore migrates a FileStore file in place and compacts on threshold', async () => {
+  const f = path.join(tmp, 'journal-legacy.json');
+  const lb = await createBus(new FileStore(f), { name: 'Legacy' });
+  await lb.registerAgent({ name: 'old' });
+  await lb.sendMessage({ from: 'old', to: '*', body: 'file-store era' });
+  const jb = await createBus(new JournalStore(f), { name: 'Legacy' });
+  assert.equal((await jb.status()).messages, 1, 'legacy state must load unchanged');
+  await jb.sendMessage({ from: 'old', to: '*', body: 'journal era' });
+  const jb2 = await createBus(new JournalStore(f), { name: 'Legacy' });
+  assert.equal((await jb2.status()).messages, 2, 'post-migration writes must persist');
+  // forced compaction: many records fold into the snapshot, state exact
+  const cf = path.join(tmp, 'journal-compact.json');
+  const cb = await createBus(new JournalStore(cf, { compactBytes: 1500, compactRecords: 8 }), { name: 'Compact' });
+  await cb.registerAgent({ name: 'c1' });
+  for (let i = 0; i < 30; i++) await cb.sendMessage({ from: 'c1', to: '*', body: `compact ${i}` });
+  const cb2 = await createBus(new JournalStore(cf), { name: 'Compact' });
+  assert.equal((await cb2.status()).messages, 30);
+  const head = JSON.parse(fs.readFileSync(cf + '.journal', 'utf8').split('\n')[0]);
+  assert.equal(typeof head.base, 'number', 'journal restarts from a base header after compaction');
 });
 
 /* ---------------- supply chain ---------------- */

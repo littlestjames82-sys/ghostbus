@@ -1,7 +1,7 @@
 # GhostBus security posture
 
 This document is the consolidated security posture of GhostBus as of
-**v0.6.0**: the architecture and its trust boundaries, the controls in
+**v0.7.0**: the architecture and its trust boundaries, the controls in
 place (grouped by family, with the hardening round that introduced
 each), the measured load evidence with its honest ceiling, and the
 known limitations — stated, not hidden.
@@ -173,9 +173,12 @@ A full read of the core and HTTP handler (not a sweep of every probe) found and 
 `scripts/load-bench.mjs` boots the real hosted server with token
 enforcement and drives concurrent agents through mixed operations,
 then reconciles the final state **exactly** (sent == stored, created
-== completed, put == stored). On the development machine (Node 24):
-25 agents × 30 s → 2,506 ops, ~83 ops/s, **0 errors**, exact
-reconciliation; 25 agents × 60 s → 3,438 ops, ~57 ops/s, 0 errors.
+== completed, put == stored). On a shared development VM (Node 24,
+1.5 shared CPUs): the v0.7.0 journal store runs 25 agents × 30 s →
+9,400 ops, ~310 ops/s, **0 errors**, exact reconciliation — against
+~123 ops/s for the same bench on the v0.6.0 whole-file store, same
+machine, same day; 50 agents land at the same ~303 ops/s (the ceiling
+is now per-workspace serialization on one thread, not state size).
 The full table, the memory behavior, and the reading of the numbers
 live in `docs/hosted.md` ("Capacity & limits"). These are
 one-machine figures about the *shape* of the limits, not an SLA.
@@ -237,17 +240,28 @@ documentation: this posture document, and three stale claims corrected
 
 ## Known limitations — stated, not hidden
 
-- **Whole-state rewrite per operation** remains (state is now written as compact JSON, roughly a third smaller, but the O(state) cost per write is unchanged).
-- **Single-file JSON store.** State is one JSON document per
-  workspace, fully loaded and re-saved per operation: per-operation
-  cost is O(state size), throughput declines as a workspace grows
-  (measured above), and concurrent writers coordinate at
-  single-operation granularity (last writer wins a colliding op).
-  Integrity within that model is proven (atomic rename, kill drill,
-  exact reconciliation under load); it is not a transactional,
-  multi-writer database. The networked store is **future work by the
-  owner's decision** — deferred, designed as an optional adapter, not
-  a current claim and not faked anywhere in the code or these docs.
+- **The hosted store is a snapshot + delta journal (v0.7.0), not a
+  database.** The hosted server loads each workspace once and appends
+  one checksummed delta record per save to `<id>.json.journal`,
+  compacting into the `<id>.json` snapshot as the journal grows —
+  per-operation cost is O(change size), and the O(state) whole-file
+  rewrite that capped the old store is gone from the hosted path.
+  Integrity within that model is proven the same way as before
+  (atomic-rename snapshots, replay that stops at the first torn
+  record, the SIGKILL kill drill, exact reconciliation under load);
+  it is still not transactional and not multi-writer: exactly one
+  hosted process owns a data directory, edits made to its files
+  behind the running server's back are not picked up until restart,
+  and journal appends are fsynced only with `GHOSTBUS_JOURNAL_FSYNC=1`
+  (process-kill durability is the default, power-loss durability is
+  the opt-in — the same posture FileStore always had). The local
+  transports (stdio, CLI, single-workspace relay) still use the
+  whole-file FileStore, whose semantics are the multi-process ones:
+  state fully loaded and re-saved per operation, concurrent writers
+  coordinating at single-operation granularity (last writer wins a
+  colliding op). The networked multi-writer store remains **future
+  work** — deferred, designed as an optional adapter, not a current
+  claim and not faked anywhere in the code or these docs.
 - **Single process, no high availability.** The hosted server is one
   Node process. If it dies, workspaces are unavailable until it
   restarts (state on disk is intact). There is no clustering,
@@ -277,7 +291,7 @@ hardening loop's honest accounting:
 | # | Step | Status after 8 rounds | Evidence |
 |---|---|---|---|
 | 1 | Harden the security model | **Done** — enforcement defaults, timing-safe compares, throttles, caps, deep input validation, MCP boundary validation, token lifecycle + rotation, serverless parity, supply-chain pinning; final sweep clean | This document; CHANGELOG v0.5.2–v0.5.9; suites 71 + 12 checks |
-| 2 | Upgrade persistence to a transactional DB | **Deferred by owner decision** — not built; the JSON store's integrity properties are proven and its ceiling is measured and documented, but it is not transactional and not multi-writer | "Known limitations" above; `docs/hosted.md` capacity section |
+| 2 | Upgrade persistence to a transactional DB | **Partially advanced in v0.7.0** — the hosted path moved from whole-file rewrites to a snapshot + delta journal (O(change) saves, ~2.5× measured throughput, state-size tax removed); a transactional, multi-writer DB remains **deferred by owner decision** — not built, and not claimed | "Known limitations" above; `docs/hosted.md` capacity section |
 | 3 | Intelligent orchestration | **Not a hardening-loop item** — the bus's existing gates (approval-required tasks, `blockedBy` dependencies, exclusive claim leases) are product features that predate the loop; no orchestration claim is made or implied by these rounds | README "How work flows"; PLAN.md |
 | 4 | Connect the coding lifecycle | **Not addressed** — product roadmap, outside the security loop's scope; nothing in these rounds should be read as progress on it | PLAN.md |
 | 5 | Prove it under load | **Done** — repeatable bench, 0 errors and exact reconciliation at 25 concurrent agents, timeout/SSE abuse limits, SIGKILL recovery drill in the suite | `docs/hosted.md` "Capacity & limits"; CHANGELOG v0.5.6 |

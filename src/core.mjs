@@ -7,14 +7,16 @@
  * acting agent and a timestamp — nothing enters the workspace anonymously.
  *
  * Storage: any object with async load() -> state|null and async save(state).
- * Ships with MemoryStore and FileStore (atomic JSON file).
+ * Ships with MemoryStore, FileStore (atomic JSON file, multi-process
+ * sharing semantics) and JournalStore (owning single-process store:
+ * snapshot + append-only delta journal — the production hosted store).
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 
-export const GHOSTBUS_VERSION = '0.6.0';
+export const GHOSTBUS_VERSION = '0.7.0';
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 // Timing-safe equality for hex digests (v0.5.3): secret comparisons must not
 // short-circuit on the first differing character the way === does.
@@ -141,6 +143,376 @@ export class FileStore {
   }
 }
 
+// ---------- JournalStore (v0.7.0): the production-scale store ----------
+//
+// Why it exists: FileStore re-reads, re-parses, re-stringifies and rewrites
+// the WHOLE state on every operation, so per-op cost is O(state size) and
+// throughput collapses as a workspace grows. JournalStore is an OWNING
+// store — exactly one process serves the workspace (the hosted server's
+// model) — so it loads once, keeps state in memory, and makes each save
+// O(change size) instead of O(state size):
+//
+// - `<file>` holds a full-state snapshot in the SAME raw JSON format
+//   FileStore writes (plus one bookkeeping key, `_journalGen`, stripped
+//   on load), so existing data files are valid snapshots as-is: pointing
+//   JournalStore at a FileStore file migrates it in place, no conversion.
+// - `<file>.journal` is an append-only log of per-save DELTA records
+//   (added/patched/removed items by identity, changed scalars, file
+//   put/del), each with a generation number and a checksum. A save
+//   appends one small record instead of rewriting the state.
+// - Load = snapshot + replay of the records after it. Replay stops at
+//   the first torn, gapped or checksum-failing record — a crash mid-
+//   append can only ever cost the in-flight operation, never earlier
+//   acknowledged work (the same clean-prefix property the SIGKILL drill
+//   pins for FileStore) — and the store then compacts to heal the tail.
+// - Compaction rewrites the snapshot and restarts the journal when the
+//   journal outgrows ~1 MB or ~1000 records. A crash between the two
+//   renames is safe: replay skips records already folded into the
+//   snapshot by generation number.
+// - How a save stays cheap: the bus reports which top-level sections it
+//   touched (GhostBus._touch, threaded into save() as a hint), and the
+//   store caches the last durable state's per-section JSON — never a
+//   second object tree — so a save serializes only the sections that
+//   changed. Every 200 saves the hint is ignored and EVERYTHING is
+//   diffed, so a section the bus ever failed to report still lands
+//   within 200 operations; the suite's round-trip checks pin the hint
+//   coverage directly. Events — append-only and never edited in place
+//   in the core — take a shape-checked fast path inside hinted saves.
+// - Durability: an append survives a process kill (page cache) exactly
+//   like FileStore's rename survives it; surviving POWER loss needs the
+//   fsync option (GHOSTBUS_JOURNAL_FSYNC=1), one fsync per save — the
+//   same caveat class as FileStore, which never fsynced either.
+// The trade, stated plainly: JournalStore is NOT multi-process. Two
+// processes pointed at one workspace through it will diverge. Sharing a
+// workspace file between processes stays FileStore's job (stdio + CLI +
+// relay); the hosted server, which already serializes each workspace
+// through one process, is the JournalStore deployment.
+const JOURNAL_ARRAY_KEYS = { agents: 'name', messages: 'id', tasks: 'id', events: 'seq' };
+
+/** Per-section JSON cache of one durable state: scalars by key, array
+ *  items as parallel keys/JSON lists, files by key. Strings, not objects:
+ *  diffing never re-serializes the old side, and there is no second state
+ *  tree to keep in sync. */
+function journalCacheOf(state) {
+  const cache = { scalars: new Map(), arrays: new Map(), files: new Map() };
+  if (!state) return cache;
+  for (const k of Object.keys(state)) {
+    if (k === 'files' || k in JOURNAL_ARRAY_KEYS) continue;
+    cache.scalars.set(k, JSON.stringify(state[k]));
+  }
+  for (const [k, keyName] of Object.entries(JOURNAL_ARRAY_KEYS)) {
+    const arr = Array.isArray(state[k]) ? state[k] : [];
+    cache.arrays.set(k, {
+      keys: arr.map(it => (it && typeof it === 'object' ? it[keyName] : undefined)),
+      elems: arr.map(it => JSON.stringify(it)),
+    });
+  }
+  for (const [k, v] of Object.entries(state.files || {})) cache.files.set(k, JSON.stringify(v));
+  return cache;
+}
+
+function journalDiffArray(oldC, newArr, keyName, { fastPath = false } = {}) {
+  const newKeys = newArr.map(it => (it && typeof it === 'object' ? it[keyName] : undefined));
+  const newElems = newArr.map(it => JSON.stringify(it));
+  const cache = { keys: newKeys, elems: newElems };
+  const oldKeys = oldC.keys;
+  const oldElems = oldC.elems;
+  if (oldKeys.length === newKeys.length && oldElems.every((e, i) => e === newElems[i])) return { rec: null, cache };
+  // Events fast path (hinted saves only): events are append-only and
+  // never edited in place in the core, so a save may only trim a prefix
+  // and append a tail. Shape-check by identity keys plus the boundary
+  // elements; full diffs (restore, the periodic audit) never take it.
+  if (fastPath && keyName === 'seq' && newKeys.length) {
+    const t = oldKeys.indexOf(newKeys[0]);
+    if (t >= 0) {
+      const appended = newKeys.length - (oldKeys.length - t);
+      if (appended >= 0) {
+        const surv = oldKeys.length - t;
+        let ok = true;
+        for (let i = 0; i < surv && ok; i++) if (newKeys[i] !== oldKeys[t + i]) ok = false;
+        if (ok && surv > 0 && (newElems[0] !== oldElems[t] || newElems[surv - 1] !== oldElems[oldKeys.length - 1])) ok = false;
+        if (ok) {
+          const d = {};
+          if (t > 0) d.del = oldKeys.slice(0, t);
+          if (appended > 0) d.add = newArr.slice(surv).map(clone);
+          return { rec: Object.keys(d).length ? d : null, cache };
+        }
+      }
+    }
+  }
+  const usable = (ks) => ks.every(k => k !== undefined && k !== null) && new Set(ks.map(String)).size === ks.length;
+  if (!usable(oldKeys) || !usable(newKeys)) return { rec: { set: clone(newArr) }, cache };
+  const newKeySet = new Set(newKeys.map(String));
+  const oldIdx = new Map(oldKeys.map((k, i) => [String(k), i]));
+  const del = oldKeys.filter(k => !newKeySet.has(String(k)));
+  const add = [];
+  const patch = {};
+  for (let i = 0; i < newArr.length; i++) {
+    const oi = oldIdx.get(String(newKeys[i]));
+    if (oi === undefined) add.push(clone(newArr[i]));
+    else if (oldElems[oi] !== newElems[i]) patch[String(newKeys[i])] = clone(newArr[i]);
+  }
+  // Reconstruction check: survivors in old order, then additions, must
+  // reproduce the new order exactly — anything else (a reorder, a
+  // restore with different shape) falls back to a full set.
+  const expected = oldKeys.filter(k => newKeySet.has(String(k))).concat(add.map(it => it[keyName]));
+  if (expected.map(String).join('\u0001') !== newKeys.map(String).join('\u0001')) return { rec: { set: clone(newArr) }, cache };
+  const d = {};
+  if (del.length) d.del = del;
+  if (Object.keys(patch).length) d.patch = patch;
+  if (add.length) d.add = add;
+  return { rec: Object.keys(d).length ? d : null, cache };
+}
+
+function journalDiffFiles(oldMap, newFiles) {
+  const cache = new Map();
+  const put = {};
+  const del = [];
+  const newKeys = Object.keys(newFiles);
+  for (const k of newKeys) {
+    const j = JSON.stringify(newFiles[k]);
+    cache.set(k, j);
+    if (!oldMap.has(k) || oldMap.get(k) !== j) put[k] = clone(newFiles[k]);
+  }
+  for (const k of oldMap.keys()) if (!Object.prototype.hasOwnProperty.call(newFiles, k)) del.push(k);
+  const changed = Object.keys(put).length + del.length;
+  if (!changed) return { rec: null, cache };
+  // Wholesale change (a restore, a mass delete): one set beats 500 puts.
+  if (changed * 2 > Math.max(oldMap.size, newKeys.length, 1) + 2) return { rec: { set: clone(newFiles) }, cache };
+  const d = {};
+  if (del.length) d.del = del;
+  if (Object.keys(put).length) d.put = put;
+  return { rec: d, cache };
+}
+
+/** Scalars = every top-level key that is not an array section or files
+ *  (workspace, the seq counters, context, any extra keys a restore
+ *  carried). Always diffed: they are small, and the counters move on
+ *  every operation. */
+function journalDiffScalars(oldMap, state) {
+  const cache = new Map();
+  const s = {};
+  const unset = [];
+  const keys = new Set(oldMap.keys());
+  for (const k of Object.keys(state)) if (k !== 'files' && !(k in JOURNAL_ARRAY_KEYS)) keys.add(k);
+  for (const k of keys) {
+    if (!Object.prototype.hasOwnProperty.call(state, k)) { unset.push(k); continue; }
+    const j = JSON.stringify(state[k]);
+    cache.set(k, j);
+    if (oldMap.get(k) !== j) s[k] = clone(state[k]);
+  }
+  const rec = {};
+  if (Object.keys(s).length) rec.s = s;
+  if (unset.length) rec.unset = unset;
+  return { rec: Object.keys(rec).length ? rec : null, cache };
+}
+
+function journalApplyRecord(state, rec) {
+  if (Array.isArray(rec.unset)) for (const k of rec.unset) delete state[k];
+  if (rec.s) for (const [k, v] of Object.entries(rec.s)) state[k] = clone(v);
+  if (rec.a) {
+    for (const [k, d] of Object.entries(rec.a)) {
+      const keyName = JOURNAL_ARRAY_KEYS[k];
+      if (!keyName || !Array.isArray(state[k])) continue;
+      if (d.set) { state[k] = clone(d.set); continue; }
+      let arr = state[k];
+      if (Array.isArray(d.del)) { const delSet = new Set(d.del.map(String)); arr = arr.filter(it => !delSet.has(String(it && it[keyName]))); }
+      if (d.patch) {
+        const idx = new Map(arr.map((it, i) => [String(it && it[keyName]), i]));
+        for (const [pk, v] of Object.entries(d.patch)) { const i = idx.get(pk); if (i !== undefined) arr[i] = clone(v); }
+      }
+      if (Array.isArray(d.add)) arr.push(...clone(d.add));
+      state[k] = arr;
+    }
+  }
+  if (rec.f) {
+    if (rec.f.set) state.files = clone(rec.f.set);
+    else {
+      if (!state.files || typeof state.files !== 'object') state.files = {};
+      if (Array.isArray(rec.f.del)) for (const k of rec.f.del) delete state.files[k];
+      if (rec.f.put) for (const [k, v] of Object.entries(rec.f.put)) state.files[k] = clone(v);
+    }
+  }
+}
+
+const journalRecordSum = (payload) => sha256(JSON.stringify(payload)).slice(0, 16);
+function journalRecordPayload(rec) {
+  const payload = { v: 1, gen: rec.gen };
+  if (rec.s) payload.s = rec.s;
+  if (rec.unset) payload.unset = rec.unset;
+  if (rec.a) payload.a = rec.a;
+  if (rec.f) payload.f = rec.f;
+  return payload;
+}
+
+export class JournalStore {
+  constructor(file, opts = {}) {
+    this.file = file;
+    this.journalFile = file + '.journal';
+    this.shared = false; // owning store: state is loaded once, never re-read per op
+    this._chain = Promise.resolve();
+    this._cache = null;        // per-section JSON of the last durable state (null until first load/save)
+    this._loadedState = null;  // the state as loaded (repeat loads return clones of it)
+    this._gen = 0;             // generation of the last durable state
+    this._loaded = false;
+    this._journalStarted = false;
+    this._journalBytes = 0;    // journal bytes since the last snapshot
+    this._records = 0;         // records since the last snapshot
+    this._sinceAudit = 0;      // saves since the last full (hint-free) diff
+    this._auditEvery = opts.auditEvery || 200;
+    this._fsync = !!opts.fsync || process.env.GHOSTBUS_JOURNAL_FSYNC === '1';
+    this._compactBytes = opts.compactBytes || 1_000_000;
+    this._compactRecords = opts.compactRecords || 1000;
+  }
+
+  async load() {
+    const p = this._chain.then(() => this._load(), () => this._load());
+    this._chain = p.catch(() => {});
+    return p;
+  }
+
+  async _load() {
+    if (this._loaded) return this._loadedState ? clone(this._loadedState) : null;
+    // Snapshot: same posture as FileStore — only a missing/empty file
+    // means "no state yet"; a corrupt one fails loudly, never resets.
+    let snapState = null;
+    let snapGen = 0;
+    let snapText = null;
+    try { snapText = await fs.promises.readFile(this.file, 'utf8'); }
+    catch (e) {
+      if (!(e && e.code === 'ENOENT')) throw fail(`store unreadable: ${e && e.message}`, 'STORE_UNREADABLE');
+    }
+    if (snapText && snapText.trim()) {
+      try { snapState = JSON.parse(snapText); }
+      catch { throw fail(`store is corrupt (not valid JSON): ${this.file} — refusing to overwrite it; restore from a backup or move the file aside`, 'STORE_CORRUPT'); }
+      if (snapState && typeof snapState._journalGen === 'number') { snapGen = snapState._journalGen; delete snapState._journalGen; }
+    }
+    let journalText = '';
+    try { journalText = await fs.promises.readFile(this.journalFile, 'utf8'); }
+    catch (e) {
+      if (!(e && e.code === 'ENOENT')) throw fail(`store unreadable: ${e && e.message}`, 'STORE_UNREADABLE');
+    }
+    let state = snapState;
+    let gen = snapGen;
+    let torn = false;
+    if (journalText) {
+      const lines = journalText.split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line.trim()) continue;
+        let rec;
+        try { rec = JSON.parse(line); } catch { torn = true; break; }
+        if (i === 0 && rec && rec.v === 1 && typeof rec.base === 'number' && rec.gen === undefined) continue; // journal header
+        if (!rec || typeof rec.gen !== 'number') { torn = true; break; }
+        if (rec.gen <= gen) continue; // already folded into the snapshot (crash mid-compaction)
+        if (rec.gen !== gen + 1) { torn = true; break; } // a gap: stop at the last whole record
+        if (rec.sum !== journalRecordSum(journalRecordPayload(rec))) { torn = true; break; }
+        if (!state) throw fail(`store is corrupt (journal has records but no snapshot): ${this.file} — restore from a backup`, 'STORE_CORRUPT');
+        journalApplyRecord(state, rec);
+        gen = rec.gen;
+      }
+    }
+    this._loadedState = state ? clone(state) : null;
+    this._cache = state ? journalCacheOf(state) : null;
+    this._gen = gen;
+    this._loaded = true;
+    this._journalStarted = journalText.length > 0;
+    this._journalBytes = Buffer.byteLength(journalText);
+    this._records = Math.max(0, gen - snapGen);
+    // Heal a torn tail immediately: fold the replayed prefix into a fresh
+    // snapshot so the bad bytes are gone before the next save appends.
+    if (torn && state) await this._compact(state);
+    return state ? clone(state) : null;
+  }
+
+  async _compact(state) {
+    await fs.promises.mkdir(path.dirname(this.file), { recursive: true });
+    const snapTmp = this.file + '.tmp.' + process.pid + '.' + Math.random().toString(36).slice(2, 10);
+    try {
+      await fs.promises.writeFile(snapTmp, JSON.stringify({ ...clone(state), _journalGen: this._gen }), { mode: 0o600 });
+      await fs.promises.chmod(snapTmp, 0o600).catch(() => {});
+      await fs.promises.rename(snapTmp, this.file);
+    } finally { await fs.promises.unlink(snapTmp).catch(() => {}); }
+    const jTmp = this.journalFile + '.tmp.' + process.pid + '.' + Math.random().toString(36).slice(2, 10);
+    try {
+      await fs.promises.writeFile(jTmp, JSON.stringify({ v: 1, base: this._gen }) + '\n', { mode: 0o600 });
+      await fs.promises.chmod(jTmp, 0o600).catch(() => {});
+      await fs.promises.rename(jTmp, this.journalFile);
+    } finally { await fs.promises.unlink(jTmp).catch(() => {}); }
+    this._journalStarted = true;
+    this._journalBytes = 0;
+    this._records = 0;
+  }
+
+  /** save(state, hint?) — hint = {dirty: Set<section>, full: bool} from
+   *  the bus (see GhostBus._touch). Stores without a hinting caller (a
+   *  direct API user) simply get a full diff every save. */
+  async save(state, hint) {
+    const run = async () => {
+      if (!this._loaded) await this._load();
+      if (!this._cache) {
+        // First durable write for a fresh workspace: lay down the
+        // snapshot; deltas journal from the next save on.
+        this._cache = journalCacheOf(state);
+        this._gen = 0;
+        await this._compact(state);
+        return;
+      }
+      this._sinceAudit += 1;
+      const full = !hint || !(hint.dirty instanceof Set) || !!hint.full || this._sinceAudit >= this._auditEvery;
+      if (full) this._sinceAudit = 0;
+      const dirty = full ? null : hint.dirty;
+      const rec = {};
+      const sc = journalDiffScalars(this._cache.scalars, state);
+      if (sc.rec) { if (sc.rec.s) rec.s = sc.rec.s; if (sc.rec.unset) rec.unset = sc.rec.unset; }
+      const a = {};
+      const newArrayCaches = new Map();
+      for (const [k, keyName] of Object.entries(JOURNAL_ARRAY_KEYS)) {
+        if (!full && !dirty.has(k)) continue;
+        const d = journalDiffArray(this._cache.arrays.get(k) || { keys: [], elems: [] }, Array.isArray(state[k]) ? state[k] : [], keyName, { fastPath: !full });
+        newArrayCaches.set(k, d.cache);
+        if (d.rec) a[k] = d.rec;
+      }
+      if (Object.keys(a).length) rec.a = a;
+      let newFilesCache = null;
+      if (full || dirty.has('files')) {
+        const d = journalDiffFiles(this._cache.files, state.files || {});
+        newFilesCache = d.cache;
+        if (d.rec) rec.f = d.rec;
+      }
+      const commitCaches = () => {
+        this._cache.scalars = sc.cache;
+        for (const [k, c] of newArrayCaches) this._cache.arrays.set(k, c);
+        if (newFilesCache) this._cache.files = newFilesCache;
+      };
+      if (!Object.keys(rec).length) { commitCaches(); return; } // nothing durable changed — append nothing
+      this._gen += 1;
+      const payload = { v: 1, gen: this._gen, ...rec };
+      const line = JSON.stringify({ ...payload, sum: journalRecordSum(payload) }) + '\n';
+      let out = line;
+      if (!this._journalStarted) out = JSON.stringify({ v: 1, base: this._gen - 1 }) + '\n' + line;
+      await fs.promises.mkdir(path.dirname(this.file), { recursive: true });
+      await fs.promises.appendFile(this.journalFile, out, { mode: 0o600 });
+      if (!this._journalStarted) await fs.promises.chmod(this.journalFile, 0o600).catch(() => {});
+      this._journalStarted = true;
+      if (this._fsync) {
+        const fh = await fs.promises.open(this.journalFile, 'a');
+        try { await fh.sync(); } finally { await fh.close(); }
+      }
+      commitCaches();
+      this._journalBytes += Buffer.byteLength(out);
+      this._records += 1;
+      if (this._journalBytes > this._compactBytes || this._records > this._compactRecords) {
+        await this._compact(state);
+        this._cache = journalCacheOf(state);
+      }
+    };
+    const p = this._chain.then(run, run);
+    this._chain = p.catch(() => {});
+    return p;
+  }
+}
+
 export class GhostBus {
   constructor(store, workspace = {}, opts = {}) {
     this.store = store;
@@ -151,6 +523,13 @@ export class GhostBus {
     this.requireTokens = !!opts.requireTokens;
     this.limits = { ...defaultLimits(), ...(opts.limits || {}) };
     this.listeners = new Set(); // live event subscribers (SSE relay)
+    // Sections mutated since the last save (v0.7.0): reported to the
+    // store as a save hint so a diffing store (JournalStore) only
+    // serializes what changed. Stores that ignore the hint (MemoryStore,
+    // FileStore) are unaffected. _restore sets _dirtyFull: its save must
+    // diff everything. A failed save restores the hint (see _save).
+    this._dirty = new Set();
+    this._dirtyFull = false;
     // Mutation mutex (v0.5.1): a promise chain serializing every public
     // operation's load -> mutate -> save cycle on THIS instance. Without it,
     // concurrent calls interleave their cycles against the shared store and
@@ -201,9 +580,24 @@ export class GhostBus {
     return this;
   }
 
-  async _save() { await this.store.save(this.state); }
+  _touch(...sections) { for (const s of sections) this._dirty.add(s); }
+
+  async _save() {
+    const hint = { dirty: new Set(this._dirty), full: this._dirtyFull };
+    this._dirty.clear();
+    this._dirtyFull = false;
+    try { await this.store.save(this.state, hint); }
+    catch (e) {
+      // The mutation did not land durably: hand the hint back so the next
+      // save still knows these sections changed.
+      for (const s of hint.dirty) this._dirty.add(s);
+      if (hint.full) this._dirtyFull = true;
+      throw e;
+    }
+  }
 
   _event(type, actor, summary, meta = {}) {
+    this._touch('events');
     this.state.seq += 1;
     const ev = { seq: this.state.seq, type, actor: actor || 'system', at: now(), summary, ...meta };
     this.state.events.push(ev);
@@ -256,6 +650,7 @@ export class GhostBus {
       }
     }
     a.lastSeenAt = now();
+    this._touch('agents'); // presence is state too: a diffing store must see it
     return a;
   }
 
@@ -275,6 +670,7 @@ export class GhostBus {
       existing.role = role ? String(role).slice(0, 200) : existing.role;
       if (Array.isArray(capabilities) && capabilities.length) existing.capabilities = capabilities.map(String).slice(0, 32);
       existing.lastSeenAt = now();
+      this._touch('agents');
       this._event('agent.rejoin', name, `${name} rejoined`);
       await this._save();
       return { agent: this._publicAgent(existing), rejoined: true };
@@ -283,6 +679,7 @@ export class GhostBus {
     const rawToken = crypto.randomBytes(24).toString('hex');
     const agent = { name, role: String(role).slice(0, 200), capabilities: Array.isArray(capabilities) ? capabilities.map(String).slice(0, 32) : [], joinedAt: now(), lastSeenAt: now(), tokenHash: sha256(rawToken) };
     this.state.agents.push(agent);
+    this._touch('agents');
     this._event('agent.join', name, `${name} joined (${agent.role || 'no role'})`);
     await this._save();
     // The raw token is returned ONCE, here. Only its hash is ever stored.
@@ -313,6 +710,7 @@ export class GhostBus {
     if (!a) throw Object.assign(new Error(`agent not registered: ${name}`), { code: 'UNKNOWN_AGENT' });
     const rawToken = crypto.randomBytes(24).toString('hex');
     a.tokenHash = sha256(rawToken);
+    this._touch('agents'); // no _requireAgent on this path — name the section explicitly
     this._event('agent.token_reset', 'operator', `operator reset the agent token for ${a.name}`);
     await this._save();
     return { agent: this._publicAgent(a), token: rawToken, tokenNote: 'New token — the old one no longer works. Shown once.' };
@@ -346,6 +744,7 @@ export class GhostBus {
       createdAt: now(), readBy: [from],
     };
     this.state.messages.push(msg);
+    this._touch('messages');
     if (this.state.messages.length > 10000) this.state.messages.splice(0, this.state.messages.length - 10000);
     this._event('message.send', from, `${from} -> ${to} (#${msg.id})`, { to, channel: msg.channel, messageId: msg.id, excerpt: msg.body.slice(0, 280) });
     await this._save();
@@ -364,7 +763,7 @@ export class GhostBus {
     if (markRead) {
       let changed = false;
       for (const m of msgs) if (!m.readBy.includes(agentName)) { m.readBy.push(agentName); changed = true; }
-      if (changed) await this._save();
+      if (changed) { this._touch('messages'); await this._save(); }
     }
     return clone(msgs);
   }
@@ -402,6 +801,7 @@ export class GhostBus {
       history: [{ at: now(), by: from, action: needsApproval ? 'created (awaiting approval)' : 'created' }],
     };
     this.state.tasks.push(task);
+    this._touch('tasks');
     this._event('task.create', from, `task #${task.id}: ${task.title}`);
     await this._save();
     return clone(task);
@@ -432,6 +832,7 @@ export class GhostBus {
         changed = true;
         task.status = 'queued'; task.claimedBy = null; task.claimExpiresAt = null; task.updatedAt = now();
         task.history.push({ at: now(), by: 'system', action: 'claim lease expired — returned to queue' });
+        this._touch('tasks');
         this._event('task.claim_expired', 'system', `task #${task.id} claim expired`);
       }
     }
@@ -456,6 +857,7 @@ export class GhostBus {
     const task = this._task(id);
     if (task.status !== 'needs-approval') throw fail(`task #${id} is not awaiting approval (status: ${task.status})`, 'CONFLICT');
     task.status = 'queued'; task.approvedBy = by; task.updatedAt = now();
+    this._touch('tasks');
     task.history.push({ at: now(), by, action: 'approved' });
     this._event('task.approve', by, `task #${id} approved`);
     await this._save();
@@ -475,6 +877,7 @@ export class GhostBus {
     const openBlockers = (task.blockedBy || []).filter(bid => { const b = this.state.tasks.find(t => t.id === bid); return b && !['done', 'cancelled'].includes(b.status); });
     if (openBlockers.length) throw Object.assign(new Error(`task #${id} is blocked by unfinished task(s): ${openBlockers.join(', ')}`), { code: 'BLOCKED' });
     task.status = 'claimed'; task.claimedBy = by;
+    this._touch('tasks');
     task.claimExpiresAt = new Date(Date.now() + CLAIM_LEASE_MS).toISOString();
     task.updatedAt = now();
     task.history.push({ at: now(), by, action: 'claimed' });
@@ -491,6 +894,7 @@ export class GhostBus {
     if (task.status !== 'claimed') throw fail(`task #${id} is not claimed (status: ${task.status})`, 'CONFLICT');
     if (task.claimedBy !== by) throw fail(`task #${id} is claimed by ${task.claimedBy}, not ${by}`, 'CONFLICT');
     task.status = 'done'; task.result = String(result); task.claimExpiresAt = null; task.updatedAt = now();
+    this._touch('tasks');
     task.history.push({ at: now(), by, action: 'completed' });
     this._event('task.complete', by, `task #${id} completed`);
     await this._save();
@@ -504,6 +908,7 @@ export class GhostBus {
     const task = this._task(id);
     if (['done', 'cancelled'].includes(task.status)) throw fail(`task #${id} already ${task.status}`, 'CONFLICT');
     task.status = 'cancelled'; task.updatedAt = now();
+    this._touch('tasks');
     task.history.push({ at: now(), by, action: 'cancelled' });
     this._event('task.cancel', by, `task #${id} cancelled`);
     await this._save();
@@ -530,6 +935,7 @@ export class GhostBus {
     const prev = this.state.files[p];
     const history = prev ? [...(prev.history || []), { text: prev.text, updatedBy: prev.updatedBy, updatedAt: prev.updatedAt }].slice(-10) : [];
     this.state.files[p] = { text, updatedBy: by, updatedAt: now(), history };
+    this._touch('files');
     this._event('file.put', by, `${by} wrote ${p} (${text.length} chars)`);
     await this._save();
     return { path: p, bytes: Buffer.byteLength(text) };
@@ -565,6 +971,7 @@ export class GhostBus {
     if (!context || typeof context !== 'object' || Array.isArray(context)) throw new Error('context must be an object');
     if (Buffer.byteLength(JSON.stringify(context)) > this.limits.maxContextBytes) throw fail(`context too large (max ${this.limits.maxContextBytes} bytes)`, 'TOO_LARGE');
     this.state.context = clone(context);
+    this._touch('context');
     this._event('context.put', by, `${by} published context`);
     await this._save();
     return { ok: true };
@@ -587,6 +994,7 @@ export class GhostBus {
     if (task.comments.length >= this.limits.maxCommentsPerTask) throw fail(`comment quota reached for task #${task.id} (max ${this.limits.maxCommentsPerTask})`, 'QUOTA');
     const comment = { by, body: String(body), at: now() };
     task.comments.push(comment);
+    this._touch('tasks');
     task.updatedAt = now();
     task.history.push({ at: now(), by, action: 'commented' });
     this._event('task.comment', by, `${by} commented on task #${id}`, { taskId: task.id });
@@ -600,6 +1008,7 @@ export class GhostBus {
     this._requireAgent(by, token);
     if (!Object.prototype.hasOwnProperty.call(this.state.files, p)) throw fail(`file not found: ${p}`, 'NOT_FOUND');
     delete this.state.files[p];
+    this._touch('files');
     this._event('file.delete', by, `${by} deleted ${p}`);
     await this._save();
     return { path: p, deleted: true };
@@ -652,6 +1061,7 @@ export class GhostBus {
       if (!create) throw fail(`capsule not found: ${slug}`, 'NOT_FOUND');
       if (by) this._requireAgent(by, token);
       this.state.files[pth] = { text: this._capsuleTemplate(slug, title), updatedBy: by || 'system', updatedAt: now(), history: [] };
+      this._touch('files');
       this._event('capsule.create', by || 'system', `capsule ${slug} created`);
       await this._save();
     }
@@ -681,6 +1091,7 @@ export class GhostBus {
     const updated = cur.slice(0, afterHead) + entry + tail.replace(/^\n+/, tail ? '\n' : '');
     const prev = this.state.files[pth];
     this.state.files[pth] = { text: updated.endsWith('\n') ? updated : updated + '\n', updatedBy: by, updatedAt: now(), history: [...(prev.history || []), { text: prev.text, updatedBy: prev.updatedBy, updatedAt: prev.updatedAt }].slice(-10) };
+    this._touch('files');
     this._event('capsule.update', by, `${by} updated capsule ${slug} [${section}]`, { capsule: slug });
     await this._save();
     return this.getFile(pth);
@@ -780,6 +1191,8 @@ export class GhostBus {
     const next = clone(snapshot);
     next.workspace = { ...next.workspace, id: this.state.workspace.id, name: next.workspace.name || this.state.workspace.name };
     this.state = next;
+    this._touch('agents', 'messages', 'tasks', 'files', 'context', 'events');
+    this._dirtyFull = true; // a restore can change anything, including section shapes
     this._event('workspace.restore', by, `workspace restored from snapshot (${next.agents.length} agents, ${next.tasks.length} tasks, ${next.messages.length} messages)`);
     await this._save();
     return this.status();

@@ -11,12 +11,25 @@ services:
     restart: unless-stopped
     environment:
       GHOSTBUS_ADMIN_KEY: "${GHOSTBUS_ADMIN_KEY:?set GHOSTBUS_ADMIN_KEY to a long secret}"
-      GHOSTBUS_REQUIRE_TOKENS: "${GHOSTBUS_REQUIRE_TOKENS:-0}"
+      # Per-agent token enforcement is the hosted server's safe default
+      # (anything but 0 = enforced). Set GHOSTBUS_REQUIRE_TOKENS=0 ONLY
+      # deliberately: without it, anyone holding a workspace key can act
+      # under any agent name in that workspace.
+      GHOSTBUS_REQUIRE_TOKENS: "${GHOSTBUS_REQUIRE_TOKENS:-1}"
+      GHOSTBUS_WORKERS: "${GHOSTBUS_WORKERS:-1}"
       GHOSTBUS_PORT: "8388"
       GHOSTBUS_DATA_DIR: "/data"
     ports:
-      - "8388:8388"
+      # Localhost only by default: put a TLS reverse proxy (Caddy/nginx)
+      # on the host in front of it. To expose the app directly instead,
+      # change this to "8388:8388" — and only behind TLS you manage.
+      - "127.0.0.1:8388:8388"
     volumes:
       - ghostbus-data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8388/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
 volumes:
   ghostbus-data:

@@ -11,6 +11,13 @@ GHOSTBUS_ADMIN_KEY=pick-a-long-admin-secret npx -y -p ghostbus ghostbus-hosted -
 #     docker run -p 8388:8388 -e GHOSTBUS_ADMIN_KEY=... -v ghostbus-data:/data ghostbus-hosted
 ```
 
+For a real VPS deployment use the kit in `deploy/docker/`: the
+one-shot `vps-setup.sh` (Docker + admin key + nightly backups, and
+with `GHOSTBUS_DOMAIN=<domain>` also Caddy HTTPS with the app bound
+to localhost only), the compose file (token enforcement on by
+default, app published on localhost — put a TLS proxy in front), and
+`RUNBOOK.md` (go-live checklist, updates, rollback, restores).
+
 Data layout in the data dir: `registry.json` (workspace metadata + key **hashes**) and, per workspace, an `<id>.json` state snapshot plus an `<id>.json.journal` delta log (v0.7.0: the hosted store loads the snapshot once and appends per-change records to the journal, compacting the journal back into the snapshot as it grows). Back up the directory and you've backed up everything.
 
 ### Operator flow

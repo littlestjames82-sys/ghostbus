@@ -190,6 +190,29 @@ await check('task dependencies: claim refused until blocker done', async () => {
   assert.equal((await bus.claimTask(dependent.id, { by: 'builder' })).status, 'claimed');
   await assert.rejects(() => bus.createTask({ from: 'planner', title: 'Bad deps', blockedBy: [9999] }), /blocker task not found/);
 });
+await check('task priority validated, not silently clamped (v0.5.12)', async () => {
+  const u = await bus.createTask({ from: 'planner', title: 'Urgent one', priority: 'urgent' });
+  assert.equal(u.priority, 'urgent');
+  assert.equal((await bus.createTask({ from: 'planner', title: 'Default prio' })).priority, 'normal');
+  assert.equal((await bus.createTask({ from: 'planner', title: 'Null prio', priority: null })).priority, 'normal');
+  await assert.rejects(() => bus.createTask({ from: 'planner', title: 'High prio', priority: 'high' }), /priority must be/);
+  await assert.rejects(() => callTool(bus, 'bus_create_task', { agent: 'planner', title: 'x', priority: 'high' }), /priority must be/);
+});
+await check('rejoin role is capped + stringified; file paths capped (v0.5.12)', async () => {
+  await bus.registerAgent({ name: 'planner', role: 'x'.repeat(5000) });
+  const pl = (await bus.listAgents()).find(a => a.name === 'planner');
+  assert.equal(typeof pl.role, 'string'); assert.equal(pl.role.length, 200);
+  await assert.rejects(() => bus.putFile({ by: 'planner', path: 'a'.repeat(300), text: 'x' }), /path too long/);
+  assert.equal((await bus.putFile({ by: 'planner', path: 'a'.repeat(256), text: 'x' })).bytes, 1);
+});
+await check('listTasks does not write the store unless a lease expired (v0.5.12)', async () => {
+  let saves = 0; const store = new MemoryStore(); const orig = store.save.bind(store);
+  store.save = async (s) => { saves++; return orig(s); };
+  const b = await createBus(store, { name: 'save-count' });
+  await b.registerAgent({ name: 'a' }); await b.createTask({ from: 'a', title: 't' });
+  const before = saves; await b.listTasks(); await b.listTasks();
+  assert.equal(saves, before);
+});
 await check('capsules: template, section update preserves others, session log appends', async () => {
   const c0 = await bus.getCapsule('demo-proj', { create: true, by: 'planner', title: 'Demo Proj' });
   for (const h of ['## State', '## Decisions (locked)', '## Next', '## Session log']) assert.ok(c0.text.includes(h), 'missing ' + h);
@@ -612,11 +635,11 @@ await check('hosted security (v0.5.2): per-agent tokens enforced BY DEFAULT — 
     assert.ok(reg.token, 'registration issues the agent token');
     // acting with NO per-agent token is rejected under the default
     const noTok = await fetch('http://127.0.0.1:18384/w/secure/api/messages', { method: 'POST', headers: K, body: JSON.stringify({ agent: 'sec-agent', to: '*', body: 'tokenless' }) });
-    assert.equal(noTok.status, 400);
+    assert.equal(noTok.status, 401);
     assert.match((await J(noTok)).error, /token required or wrong/);
     // a WRONG token is rejected too
     const badTok = await fetch('http://127.0.0.1:18384/w/secure/api/messages', { method: 'POST', headers: { ...K, 'x-agent-token': 'deadbeefdeadbeef' }, body: JSON.stringify({ agent: 'sec-agent', to: '*', body: 'wrong token' }) });
-    assert.equal(badTok.status, 400);
+    assert.equal(badTok.status, 401);
     // the ISSUED token works, as header and as body field
     const okMsg = await fetch('http://127.0.0.1:18384/w/secure/api/messages', { method: 'POST', headers: { ...K, 'x-agent-token': reg.token }, body: JSON.stringify({ agent: 'sec-agent', to: '*', body: 'with token' }) });
     assert.equal(okMsg.status, 200);
@@ -1018,7 +1041,7 @@ await check('mcp stdio fuzz (v0.5.5): hostile frames + per-tool arg fuzz never c
         variants++;
       }
     }
-    assert.equal(variants, 65); // every declared property of all 29 tools, one wrong-typed variant each
+    assert.equal(variants, 73); // every declared property of all 29 tools, one wrong-typed variant each (v0.6.0: +agent/token on 4 read tools)
     // a 100KB string body and a 300-deep nested context are legitimate
     // shapes — both must be handled without drama.
     assert.ok(!(await call('bus_send', { agent: 'fuzz-a', to: 'fuzz-b', body: 'y'.repeat(100_000) })).result.isError);
@@ -1106,7 +1129,7 @@ await check('http params (v0.5.5): garbage numbers clamp; method/route/traversal
     assert.equal((await fetch(B + '/api/tasks/1/claim')).status, 404);
     assert.equal((await fetch(B + '/api/status/')).status, 404);
     assert.equal((await fetch(B + '/api/nope')).status, 404);
-    assert.equal((await fetch(B + '/api/files?path=' + encodeURIComponent('../secret'))).status, 400); // inert key miss, not a traversal
+    assert.equal((await fetch(B + '/api/files?path=' + encodeURIComponent('../secret'))).status, 404); // inert key miss, not a traversal
   } finally { proc.kill(); }
   // hosted: encoded traversal in the workspace segment never resolves
   const dataDir = path.join(tmp, 'params-hosted');
@@ -1385,7 +1408,7 @@ await check('hosted tokens (v0.5.7): REST rotation is immediate; delivered crede
     // rotation requires the CURRENT token — a name alone cannot rotate a
     // (possibly leaked-token) identity out from under its owner
     const noTokRot = await fetch('http://127.0.0.1:18415/w/tok/api/agents/rotate-token', { method: 'POST', headers: K, body: JSON.stringify({ agent: 'tok-agent' }) });
-    assert.equal(noTokRot.status, 400);
+    assert.equal(noTokRot.status, 401);
     // the REST route (new in v0.5.7 — rotation used to be MCP-only): the
     // old token is dead on the VERY NEXT request after the rotation reply
     const rotRes = await fetch('http://127.0.0.1:18415/w/tok/api/agents/rotate-token', { method: 'POST', headers: { ...K, 'x-agent-token': reg.token }, body: JSON.stringify({ agent: 'tok-agent' }) });
@@ -1394,7 +1417,7 @@ await check('hosted tokens (v0.5.7): REST rotation is immediate; delivered crede
     assert.match(rot.token, /^[0-9a-f]{48}$/);
     assert.notEqual(rot.token, reg.token);
     const dead = await act(reg.token);
-    assert.equal(dead.status, 400);
+    assert.equal(dead.status, 401);
     assert.match((await J(dead)).error, /token required or wrong/);
     assert.equal((await act(rot.token)).status, 200);
     // the provenance log NAMES the rotation but never carries a token —
@@ -1419,6 +1442,188 @@ await check('hosted tokens (v0.5.7): REST rotation is immediate; delivered crede
     assert.ok(!err.includes(rot.token) && !err.includes(reg.token), 'an agent token reached server stderr');
     assert.ok(!err.includes(c.key) && !err.includes('tokens-admin-secret-0123'), 'a key reached server stderr');
   } finally { proc.kill(); }
+});
+
+/* ---------------- v0.6.0: quotas, DM confidentiality, status codes, recovery ---------------- */
+console.log('v0.6.0 review round:');
+const { createBusHandler, clientIp, statusForError } = await import('./src/handler.mjs');
+const http = await import('node:http');
+const serveBus = async (b, key = '') => {
+  const h = createBusHandler({ id: 't', bus: b, key });
+  const srv = http.createServer((req, res) => h(req, res, new URL(req.url, 'http://x')));
+  await new Promise(r => srv.listen(0, '127.0.0.1', r));
+  return { base: `http://127.0.0.1:${srv.address().port}`, close: () => srv.closeAllConnections?.() || srv.close() };
+};
+const J = { 'content-type': 'application/json' };
+
+await check('quotas (v0.6.0): tasks prune finished work or refuse; files/agents/comments/size capped', async () => {
+  const q = await createBus(new MemoryStore(), {}, { limits: { maxTasks: 20, maxFiles: 2, maxAgents: 2, maxCommentsPerTask: 2, maxFileBytes: 10, maxContextBytes: 20 } });
+  await q.registerAgent({ name: 'a' }); await q.registerAgent({ name: 'b' });
+  await assert.rejects(() => q.registerAgent({ name: 'c' }), (e) => e.code === 'QUOTA');
+  assert.equal((await q.registerAgent({ name: 'a' })).rejoined, true); // rejoin is not a new agent
+  // 20 live tasks: the 21st is refused (nothing finished to prune)
+  const ids = []; for (let i = 0; i < 20; i++) ids.push((await q.createTask({ from: 'a', title: 't' + i })).id);
+  await assert.rejects(() => q.createTask({ from: 'a', title: 'overflow' }), (e) => e.code === 'QUOTA');
+  // finish two (one is a live task's blocker -> protected), then create succeeds by pruning the other
+  const dep = await q.createTask.call(q, { from: 'a', title: 'x' }).catch(() => null); assert.equal(dep, null);
+  for (const id of ids.slice(0, 2)) { await q.claimTask(id, { by: 'b' }); await q.completeTask(id, { by: 'b', result: 'ok' }); }
+  const n = await q.createTask({ from: 'a', title: 'fits after prune', blockedBy: [ids[0]] });
+  const left = (await q.listTasks()).map(t => t.id);
+  assert.ok(left.includes(n.id) && left.includes(ids[0]), 'blocker of the new task must survive pruning');
+  assert.ok(!left.includes(ids[1]), 'oldest unreferenced finished task is pruned');
+  assert.ok((await q.events({ limit: 50 })).some(e => e.type === 'task.prune'));
+  await q.putFile({ by: 'a', path: 'f1', text: 'x' }); await q.putFile({ by: 'a', path: 'f2', text: 'x' });
+  await assert.rejects(() => q.putFile({ by: 'a', path: 'f3', text: 'x' }), (e) => e.code === 'QUOTA');
+  await q.putFile({ by: 'a', path: 'f1', text: 'y' }); // overwrite is fine at the cap
+  await assert.rejects(() => q.putFile({ by: 'a', path: 'f1', text: 'z'.repeat(11) }), (e) => e.code === 'TOO_LARGE');
+  await assert.rejects(() => q.putContext({ by: 'a', context: { k: 'v'.repeat(30) } }), (e) => e.code === 'TOO_LARGE');
+  await q.addTaskComment(n.id, { by: 'a', body: '1' }); await q.addTaskComment(n.id, { by: 'a', body: '2' });
+  await assert.rejects(() => q.addTaskComment(n.id, { by: 'a', body: '3' }), (e) => e.code === 'QUOTA');
+});
+
+await check('DM confidentiality (v0.6.0): enforced bus hides other agents\' direct messages on every read path', async () => {
+  const e = await createBus(new MemoryStore(), {}, { requireTokens: true });
+  const ta = (await e.registerAgent({ name: 'alice' })).token, tb = (await e.registerAgent({ name: 'bob' })).token, tc = (await e.registerAgent({ name: 'carol' })).token;
+  const dm = await e.sendMessage({ from: 'alice', to: 'bob', body: 'dm-secret-4417', token: ta });
+  await e.sendMessage({ from: 'alice', to: '*', body: 'public-note-4417', token: ta });
+  const bodies = (r) => r.messages.map(m => m.body).join('|');
+  // carol (valid token) and an unauthenticated caller: broadcast only
+  assert.ok(!bodies(await e.search('4417', { agent: 'carol', token: tc })).includes('dm-secret'));
+  assert.ok(bodies(await e.search('4417', { agent: 'carol', token: tc })).includes('public-note'));
+  assert.ok(!bodies(await e.search('4417')).includes('dm-secret'));
+  assert.ok(!bodies(await e.search('4417', { agent: 'bob', token: 'wrong' })).includes('dm-secret'), 'a wrong token must not unlock bob\'s view');
+  assert.ok(!bodies(await e.search('4417', { agent: 'carol', token: tb })).includes('dm-secret'), 'another agent\'s token must not unlock');
+  // bob and alice see it
+  assert.ok(bodies(await e.search('4417', { agent: 'bob', token: tb })).includes('dm-secret'));
+  assert.ok(bodies(await e.search('4417', { agent: 'alice', token: ta })).includes('dm-secret'));
+  // events + sync: excerpt stripped for outsiders, kept for the participants
+  const ex = (evs) => evs.find(x => x.type === 'message.send' && x.to === 'bob');
+  assert.equal(ex(await e.events({ limit: 50, agent: 'carol', token: tc })).excerpt, undefined);
+  assert.equal(ex((await e.sync({ agent: 'carol', token: tc })).events).excerpt, undefined);
+  assert.equal(ex(await e.events({ limit: 50 })).excerpt, undefined);
+  assert.match(ex(await e.events({ limit: 50, agent: 'bob', token: tb })).excerpt, /dm-secret/);
+  // thread: invisible root is "not found", not a leak
+  await assert.rejects(() => e.thread(dm.id, { agent: 'carol', token: tc }), (er) => er.code === 'NOT_FOUND');
+  assert.equal((await e.thread(dm.id, { agent: 'bob', token: tb })).length, 1);
+  // through the tool layer too
+  await assert.rejects(() => callTool(e, 'bus_thread', { id: dm.id }), /not found/);
+  // non-enforcing bus is unchanged (no identity to protect)
+  const open = await createBus(new MemoryStore());
+  await open.registerAgent({ name: 'x' }); await open.registerAgent({ name: 'y' });
+  await open.sendMessage({ from: 'x', to: 'y', body: 'open-dm-7788' });
+  assert.ok(bodies(await open.search('7788')).includes('open-dm'));
+});
+
+await check('SSE + long-poll are agent-scoped on an enforced bus; DM excerpts redacted live (v0.6.0)', async () => {
+  const e = await createBus(new MemoryStore(), {}, { requireTokens: true });
+  const ta = (await e.registerAgent({ name: 'alice' })).token, tb = (await e.registerAgent({ name: 'bob' })).token, tc = (await e.registerAgent({ name: 'carol' })).token;
+  const s = await serveBus(e);
+  try {
+    assert.equal((await fetch(s.base + '/api/stream?agent=bob')).status, 401, 'stream without a token');
+    assert.equal((await fetch(s.base + '/api/stream?agent=bob&token=' + tc)).status, 401, 'stream with another agent\'s token');
+    assert.equal((await fetch(s.base + '/api/wait?agent=bob&timeout=0')).status, 401);
+    // carol long-polls and must not see bob's DM text
+    const poll = fetch(s.base + '/api/wait?agent=carol&timeout=5&token=' + tc).then(r => r.json());
+    await new Promise(r => setTimeout(r, 150));
+    await e.sendMessage({ from: 'alice', to: 'bob', body: 'live-secret-9921', token: ta });
+    await e.sendMessage({ from: 'alice', to: '*', body: 'live-public-9921', token: ta });
+    const got = JSON.stringify(await poll);
+    assert.ok(!got.includes('live-secret'), 'DM text reached a bystander over long-poll');
+    const bobPoll = await (await fetch(s.base + '/api/wait?agent=bob&sinceSeq=0&timeout=0', { headers: { 'x-agent-token': tb } })).json();
+    assert.ok(JSON.stringify(bobPoll).includes('live-secret'), 'bob must see his own DM');
+    // REST read routes
+    const srch = await (await fetch(s.base + '/api/search?q=9921&agent=carol', { headers: { 'x-agent-token': tc } })).json();
+    assert.ok(!JSON.stringify(srch).includes('live-secret'));
+  } finally { s.close(); }
+});
+
+await check('HTTP status codes (v0.6.0): 401 auth, 404 missing, 409 conflict, 413/507 limits, 500 storage faults — never a blanket 400', async () => {
+  const e = await createBus(new MemoryStore(), {}, { requireTokens: true, limits: { maxFileBytes: 5, maxFiles: 1 } });
+  const ta = (await e.registerAgent({ name: 'alice' })).token, tb = (await e.registerAgent({ name: 'bob' })).token;
+  const s = await serveBus(e);
+  const post = (p, b, tok) => fetch(s.base + p, { method: 'POST', headers: { ...J, ...(tok ? { 'x-agent-token': tok } : {}) }, body: JSON.stringify(b) });
+  try {
+    assert.equal((await post('/api/tasks', { agent: 'alice', title: 't' })).status, 401);
+    assert.equal((await post('/api/tasks', { agent: 'alice', title: 't' }, 'nope')).status, 401);
+    assert.equal((await post('/api/tasks', { agent: 'ghost', title: 't' }, ta)).status, 400); // unknown agent = bad request
+    assert.equal((await post('/api/tasks', { agent: 'alice', title: 't', priority: 'high' }, ta)).status, 400);
+    const t = await (await post('/api/tasks', { agent: 'alice', title: 'real' }, ta)).json();
+    assert.equal((await post(`/api/tasks/${t.id}/complete`, { agent: 'bob' }, tb)).status, 409, 'complete a task that is not claimed');
+    assert.equal((await post('/api/tasks/999/claim', { agent: 'bob' }, tb)).status, 404);
+    assert.equal((await post(`/api/tasks/${t.id}/claim`, { agent: 'bob' }, tb)).status, 200);
+    assert.equal((await post(`/api/tasks/${t.id}/claim`, { agent: 'alice' }, ta)).status, 409, 'already claimed');
+    assert.equal((await fetch(s.base + '/api/files?path=missing')).status, 404);
+    const put = (p, text) => fetch(s.base + '/api/files', { method: 'PUT', headers: { ...J, 'x-agent-token': ta }, body: JSON.stringify({ agent: 'alice', path: p, text }) });
+    assert.equal((await put('a', 'toolong')).status, 413);
+    assert.equal((await put('a', 'ok')).status, 200);
+    { const rq = await put('b', 'ok'); assert.equal(rq.status, 507, 'file quota: ' + rq.status + ' ' + (await rq.text())); }
+  } finally { s.close(); }
+  // storage faults are 500 with no internals leaked; plain validation errors stay 400
+  assert.equal(statusForError(Object.assign(new Error('boom'), { code: 'ENOSPC' })), 500);
+  assert.equal(statusForError(Object.assign(new Error('boom'), { code: 'STORE_CORRUPT' })), 500);
+  assert.equal(statusForError(new Error('title required')), 400);
+  const faulty = { requireTokens: false, status: async () => { throw Object.assign(new Error('/secret/path/disk full'), { code: 'ENOSPC' }); } };
+  const s2 = await serveBus(faulty);
+  try {
+    const r = await fetch(s2.base + '/api/status'); const body = await r.json();
+    assert.equal(r.status, 500); assert.equal(body.error, 'internal error'); assert.ok(!JSON.stringify(body).includes('secret'));
+  } finally { s2.close(); }
+});
+
+await check('query-string tokens deprecated + opt-out; clientIp honours X-Forwarded-For only from trusted proxies (v0.6.0)', async () => {
+  const e = await createBus(new MemoryStore(), {}, { requireTokens: true });
+  const ta = (await e.registerAgent({ name: 'alice' })).token;
+  const s = await serveBus(e);
+  try {
+    const viaQuery = await fetch(s.base + '/api/inbox?agent=alice&token=' + ta);
+    assert.equal(viaQuery.status, 200); assert.equal(viaQuery.headers.get('deprecation'), 'true');
+    const viaHeader = await fetch(s.base + '/api/inbox?agent=alice', { headers: { 'x-agent-token': ta } });
+    assert.equal(viaHeader.status, 200); assert.equal(viaHeader.headers.get('deprecation'), null);
+    process.env.GHOSTBUS_ALLOW_QUERY_TOKEN = '0';
+    try { assert.equal((await fetch(s.base + '/api/inbox?agent=alice&token=' + ta)).status, 401, 'query tokens refused when disabled'); }
+    finally { delete process.env.GHOSTBUS_ALLOW_QUERY_TOKEN; }
+  } finally { s.close(); }
+  const fake = (addr, xff) => ({ socket: { remoteAddress: addr }, headers: xff ? { 'x-forwarded-for': xff } : {} });
+  delete process.env.GHOSTBUS_TRUSTED_PROXIES;
+  assert.equal(clientIp(fake('10.0.0.9', '1.2.3.4')), '10.0.0.9', 'default: header ignored, no spoofing');
+  process.env.GHOSTBUS_TRUSTED_PROXIES = '10.0.0.1,loopback';
+  try {
+    assert.equal(clientIp(fake('10.0.0.1', '1.2.3.4')), '1.2.3.4');
+    assert.equal(clientIp(fake('::ffff:10.0.0.1', '9.9.9.9, 1.2.3.4')), '1.2.3.4', 'right-most untrusted hop, client-supplied prefix ignored');
+    assert.equal(clientIp(fake('127.0.0.1', '5.6.7.8, 10.0.0.1')), '5.6.7.8');
+    assert.equal(clientIp(fake('10.0.0.77', '1.2.3.4')), '10.0.0.77', 'untrusted peer cannot spoof');
+    assert.equal(clientIp(fake('10.0.0.1')), '10.0.0.1', 'trusted peer with no header');
+  } finally { delete process.env.GHOSTBUS_TRUSTED_PROXIES; }
+});
+
+await check('operator token reset: old token dies, new works, event logged, no agent-facing path (v0.6.0)', async () => {
+  const e = await createBus(new MemoryStore(), {}, { requireTokens: true });
+  const old = (await e.registerAgent({ name: 'lost' })).token;
+  const r = await e.operatorResetAgentToken({ name: 'lost' });
+  assert.match(r.token, /^[0-9a-f]{48}$/);
+  await assert.rejects(() => e.sendMessage({ from: 'lost', body: 'x', token: old }), (er) => er.code === 'AGENT_AUTH');
+  assert.ok((await e.sendMessage({ from: 'lost', body: 'back', token: r.token })).id);
+  assert.ok((await e.events({ limit: 50 })).some(ev => ev.type === 'agent.token_reset' && ev.actor === 'operator'));
+  await assert.rejects(() => e.operatorResetAgentToken({ name: 'nobody' }), (er) => er.code === 'UNKNOWN_AGENT');
+  assert.ok(!TOOLS.some(t => /reset/.test(t.name)), 'reset must not be an MCP tool');
+  const s = await serveBus(e);
+  try { assert.equal((await fetch(s.base + '/api/agents/lost/reset-token', { method: 'POST' })).status, 404, 'no agent-facing reset route'); } finally { s.close(); }
+});
+
+await check('FileStore never replaces unreadable data with an empty workspace; compact JSON on disk (v0.6.0)', async () => {
+  const f = path.join(tmp, 'corrupt.json');
+  fs.writeFileSync(f, '{"agents": [ {truncated');
+  const st = new FileStore(f);
+  await assert.rejects(() => st.load(), (er) => er.code === 'STORE_CORRUPT');
+  await assert.rejects(() => createBus(new FileStore(f)), (er) => er.code === 'STORE_CORRUPT');
+  assert.equal(fs.readFileSync(f, 'utf8'), '{"agents": [ {truncated', 'the corrupt file must be left untouched for recovery');
+  assert.equal(await new FileStore(path.join(tmp, 'does-not-exist.json')).load(), null);
+  fs.writeFileSync(path.join(tmp, 'empty.json'), '  \n');
+  assert.equal(await new FileStore(path.join(tmp, 'empty.json')).load(), null);
+  const g = path.join(tmp, 'compact.json');
+  const b = await createBus(new FileStore(g)); await b.registerAgent({ name: 'z' });
+  assert.ok(!fs.readFileSync(g, 'utf8').includes('\n'), 'state file is compact JSON');
+  assert.equal((await createBus(new FileStore(g))).state.agents.length, 1, 'compact file round-trips');
 });
 
 /* ---------------- supply chain ---------------- */

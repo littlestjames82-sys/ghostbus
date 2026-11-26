@@ -1,7 +1,7 @@
 # GhostBus security posture
 
 This document is the consolidated security posture of GhostBus as of
-**v0.5.11**: the architecture and its trust boundaries, the controls in
+**v0.6.0**: the architecture and its trust boundaries, the controls in
 place (grouped by family, with the hardening round that introduced
 each), the measured load evidence with its honest ceiling, and the
 known limitations — stated, not hidden.
@@ -157,6 +157,17 @@ an evaluator reads it.
   versions per file), and exports/imports give portable, hash-only
   backups (v0.5.0).
 
+### Review round (v0.6.0)
+
+A full read of the core and HTTP handler (not a sweep of every probe) found and closed these:
+
+- **Direct-message confidentiality on enforcing buses.** With per-agent tokens enforced, `inbox` was protected but `search`, `bus_thread`, `bus_sync`, `bus_events`, `/api/stream` and `/api/wait` ignored identity, so any holder of the workspace key could read other agents' direct messages (stream/wait even trusted an unauthenticated `?agent=` name). Those paths now take a verified identity: unproven callers see broadcasts only, DM excerpts are stripped from events they receive, and the stream/long-poll routes answer `401` without the agent's token. A bus that does not enforce tokens has no identity to protect and behaves as before.
+- **Storage can no longer silently reset a workspace.** `FileStore.load()` returned "no state" for *any* read or parse error, so a corrupt or unreadable store file was replaced by an empty workspace on the next write. Only a missing/empty file means "new" now; anything else raises `STORE_CORRUPT`/`STORE_UNREADABLE` (HTTP 500) and leaves the file untouched.
+- **Quotas.** Per-workspace caps on tasks (finished, unreferenced tasks are pruned first), files, agents, comments per task, file size and context size — all env-tunable (`GHOSTBUS_MAX_*`), refusing with `507`/`413` instead of growing without bound. Existing long-lived buses are unaffected until they reach the (generous) defaults.
+- **Honest status codes.** `401` agent-token failures, `404` not found, `409` state conflicts, `413`/`507` limits, `500` (generic body, details to stderr) for storage faults. Previously everything was `400`.
+- **Token hygiene.** `?token=` is deprecated (flagged with `Deprecation`/`Warning` headers; refused with `GHOSTBUS_ALLOW_QUERY_TOKEN=0`; `/api/stream` and `/api/wait` still accept it because `EventSource` cannot send headers). A lost agent token has an operator recovery path (`ghostbus-cli reset-token`, hosted `POST /api/workspaces/<id>/agents/<name>/reset-token` with the admin key) — deliberately not reachable by agents or over MCP.
+- **Rate limiting behind a proxy.** `GHOSTBUS_TRUSTED_PROXIES` (IPs and/or `loopback`) makes the limiter key on the real client via `X-Forwarded-For`, trusted only from those peers (right-most untrusted hop; an untrusted peer cannot spoof the header).
+
 ### Load evidence (summary)
 
 `scripts/load-bench.mjs` boots the real hosted server with token
@@ -226,6 +237,7 @@ documentation: this posture document, and three stale claims corrected
 
 ## Known limitations — stated, not hidden
 
+- **Whole-state rewrite per operation** remains (state is now written as compact JSON, roughly a third smaller, but the O(state) cost per write is unchanged).
 - **Single-file JSON store.** State is one JSON document per
   workspace, fully loaded and re-saved per operation: per-operation
   cost is O(state size), throughput declines as a workspace grows

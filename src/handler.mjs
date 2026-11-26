@@ -10,13 +10,37 @@
  */
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import { GHOSTBUS_VERSION } from './core.mjs';
+import { GHOSTBUS_VERSION, statusForError } from './core.mjs';
 import { TOOLS, callTool } from './tools.mjs';
 
 export const BOARD_HTML = fs.readFileSync(new URL('./board.html', import.meta.url), 'utf8');
 
+// Query-string tokens end up in proxy/access logs, so they are deprecated (v0.6.0): still accepted
+// by default for compatibility (the browser EventSource cannot set headers, so /api/stream and
+// /api/wait always accept them), flagged with Deprecation/Warning headers on REST routes, and
+// refused there entirely when GHOSTBUS_ALLOW_QUERY_TOKEN=0. Prefer the x-agent-token header.
+const queryTokenAllowed = () => process.env.GHOSTBUS_ALLOW_QUERY_TOKEN !== '0';
 const agentTokenOf = (req, body = {}, q = {}) =>
-  body.token || q.token || req.headers['x-agent-token'] || null;
+  body.token || (queryTokenAllowed() ? q.token : null) || req.headers['x-agent-token'] || null;
+
+// Client address for rate limiting (v0.6.0). Default: the socket peer. Behind a reverse proxy every
+// client shares the proxy's address, so operators can name trusted proxies with
+// GHOSTBUS_TRUSTED_PROXIES (comma-separated IPs, or the word "loopback"); X-Forwarded-For is then
+// honoured ONLY when the socket peer is one of them, taking the right-most hop that is not itself
+// a trusted proxy. An untrusted peer can never spoof its address with the header.
+const stripV6 = (a) => String(a || '').replace(/^::ffff:/i, '');
+export function clientIp(req) {
+  const sock = stripV6(req.socket && req.socket.remoteAddress) || 'unknown';
+  const list = String(process.env.GHOSTBUS_TRUSTED_PROXIES || '').split(',').map(x => stripV6(x.trim())).filter(Boolean);
+  if (!list.length) return sock;
+  const trusted = (a) => list.includes(a) || (list.includes('loopback') && (a === '127.0.0.1' || a === '::1'));
+  if (!trusted(sock)) return sock;
+  const hops = String(req.headers['x-forwarded-for'] || '').split(',').map(x => stripV6(x.trim())).filter(Boolean);
+  for (let i = hops.length - 1; i >= 0; i--) if (!trusted(hops[i])) return hops[i];
+  return sock;
+}
+
+export { statusForError };
 
 const hashEq = (given, expected) => {
   const a = Buffer.from(crypto.createHash('sha256').update(String(given)).digest('hex'));
@@ -175,7 +199,7 @@ export function createBusHandler({ id = 'default', bus, key = '' }) {
   const buckets = new Map();
   const rateLimit = rateLimitPerMin();
   const rateOk = (req) => {
-    const ip = (req.socket && req.socket.remoteAddress) || 'unknown';
+    const ip = clientIp(req);
     const t = Date.now();
     // Opportunistic sweep: one bucket per source IP per minute would
     // otherwise accumulate forever on a long-lived server (v0.5.6).
@@ -225,6 +249,9 @@ export function createBusHandler({ id = 'default', bus, key = '' }) {
       if (req.method === 'GET' && url.pathname === '/api/stream') {
         const agent = url.searchParams.get('agent');
         if (!agent) return send(400, { error: 'agent query param required' });
+        // v0.6.0: on a token-enforcing bus the stream is agent-scoped, so the agent must prove itself
+        // (header, or ?token= because EventSource cannot set headers) — it used to trust ?agent=.
+        if (bus.requireTokens && !(await bus.verifyAgent(agent, req.headers['x-agent-token'] || url.searchParams.get('token')))) return send(401, { error: `agent token required or wrong for: ${agent}`, code: 'AGENT_AUTH' });
         // Stream caps (v0.5.6): refuse BEFORE opening the stream — a 429 the
         // client can back off from, not a socket that dies later.
         const maxPerWorkspace = streamCap('GHOSTBUS_MAX_STREAMS_PER_WORKSPACE', 100);
@@ -238,7 +265,7 @@ export function createBusHandler({ id = 'default', bus, key = '' }) {
         const off = bus.onEvent((ev) => {
           const forMe = ev.type === 'message.send' ? (ev.to === agent || ev.to === '*' || ev.actor === agent) : true;
           if (!forMe) return;
-          try { res.write(`event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`); } catch { cleanup(); }
+          try { res.write(`event: ${ev.type}\ndata: ${JSON.stringify(bus.redactEvent(ev, agent))}\n\n`); } catch { cleanup(); }
         });
         const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch { cleanup(); } }, 25000);
         // Reaping (v0.5.6): whichever side of the connection dies first —
@@ -259,14 +286,15 @@ export function createBusHandler({ id = 'default', bus, key = '' }) {
       if (req.method === 'GET' && url.pathname === '/api/wait') {
         const agent = url.searchParams.get('agent');
         if (!agent) return send(400, { error: 'agent query param required' });
+        if (bus.requireTokens && !(await bus.verifyAgent(agent, req.headers['x-agent-token'] || url.searchParams.get('token')))) return send(401, { error: `agent token required or wrong for: ${agent}`, code: 'AGENT_AUTH' });
         // Garbage timeouts (timeout=abc -> NaN -> an instant empty reply;
         // negative -> the same) fall back to the 25s default; real values
         // clamp into [0, 55]s (v0.5.5).
         const tParam = Number(url.searchParams.get('timeout') || 25);
         const timeout = (Number.isFinite(tParam) ? Math.min(Math.max(tParam, 0), 55) : 25) * 1000;
         const sinceSeq = url.searchParams.has('sinceSeq') ? Number(url.searchParams.get('sinceSeq')) : (await bus.sync({})).headSeq;
-        const immediate = await bus.sync({ sinceSeq, limit: 100 });
-        const relevantNow = immediate.events.filter(ev => ev.type !== 'message.send' || ev.to === agent || ev.to === '*' || ev.actor === agent);
+        const immediate = await bus.sync({ sinceSeq, limit: 100, agent, token: req.headers['x-agent-token'] || url.searchParams.get('token') });
+        const relevantNow = immediate.events.filter(ev => ev.type !== 'message.send' || ev.to === agent || ev.to === '*' || ev.actor === agent).map(ev => bus.redactEvent(ev, agent));
         if (relevantNow.length) return send(200, { events: relevantNow, headSeq: immediate.headSeq, waited: false });
         return await new Promise((resolve) => {
           let done = false;
@@ -274,7 +302,7 @@ export function createBusHandler({ id = 'default', bus, key = '' }) {
           const off = bus.onEvent((ev) => {
             if (ev.seq <= sinceSeq) return;
             if (ev.type === 'message.send' && !(ev.to === agent || ev.to === '*' || ev.actor === agent)) return;
-            finish([ev]);
+            finish([bus.redactEvent(ev, agent)]);
           });
           const timer = setTimeout(() => finish([]), timeout);
           req.on('close', () => { if (!done) { done = true; off(); clearTimeout(timer); resolve(); } });
@@ -302,6 +330,7 @@ export function createBusHandler({ id = 'default', bus, key = '' }) {
       if (body === TOO_LARGE) return; // 413 already sent
       const safeBody = body && typeof body === 'object' ? body : {};
       const q = Object.fromEntries(url.searchParams);
+      if (q.token) { res.setHeader('deprecation', 'true'); res.setHeader('warning', '299 ghostbus "query-string tokens are deprecated; send the x-agent-token header"'); }
 
       if (req.method === 'GET' && url.pathname === '/api/status') return send(200, await bus.status());
       if (req.method === 'GET' && url.pathname === '/api/agents') return send(200, { agents: await bus.listAgents() });
@@ -316,7 +345,7 @@ export function createBusHandler({ id = 'default', bus, key = '' }) {
       if (req.method === 'POST' && url.pathname === '/api/messages') return send(200, await bus.sendMessage({ from: safeBody.agent, to: safeBody.to ?? '*', body: safeBody.body, channel: safeBody.channel ?? 'general', threadId: safeBody.threadId ?? null, token: agentTokenOf(req, safeBody) }));
       if (req.method === 'GET' && url.pathname === '/api/inbox') return send(200, { messages: await bus.inbox(q.agent, { unreadOnly: q.unread === '1', limit: Number(q.limit || 50), token: agentTokenOf(req, {}, q) }) });
       if (req.method === 'POST' && url.pathname === '/api/heartbeat') return send(200, await bus.heartbeat({ name: safeBody.agent, token: agentTokenOf(req, safeBody) }));
-      if (req.method === 'GET' && url.pathname === '/api/search') return send(200, await bus.search(q.q || '', { limit: Number(q.limit || 20) }));
+      if (req.method === 'GET' && url.pathname === '/api/search') return send(200, await bus.search(q.q || '', { limit: Number(q.limit || 20), agent: q.agent, token: agentTokenOf(req, {}, q) }));
       if (req.method === 'GET' && url.pathname === '/api/channels') return send(200, { channels: await bus.listChannels() });
       if (req.method === 'POST' && url.pathname === '/api/tasks') return send(200, await bus.createTask({ from: safeBody.agent, title: safeBody.title, body: safeBody.body ?? '', assignee: safeBody.assignee ?? null, priority: safeBody.priority ?? 'normal', needsApproval: !!safeBody.needsApproval, blockedBy: safeBody.blockedBy ?? [], token: agentTokenOf(req, safeBody) }));
       if (req.method === 'GET' && url.pathname === '/api/tasks') return send(200, { tasks: await bus.listTasks({ status: q.status || null, assignee: q.assignee || null }) });
@@ -339,8 +368,8 @@ export function createBusHandler({ id = 'default', bus, key = '' }) {
       if (req.method === 'PUT' && url.pathname === '/api/context') return send(200, await bus.putContext({ by: safeBody.agent, context: safeBody.context, token: agentTokenOf(req, safeBody) }));
       if (req.method === 'GET' && url.pathname === '/api/context') return send(200, await bus.getContext());
       if (req.method === 'GET' && url.pathname === '/api/board') return send(200, { board: await bus.board() });
-      if (req.method === 'GET' && url.pathname === '/api/events') return send(200, { events: await bus.events({ limit: Number(q.limit || 50) }) });
-      if (req.method === 'GET' && url.pathname === '/api/sync') return send(200, await bus.sync({ sinceSeq: Number(q.sinceSeq || 0), limit: Number(q.limit || 500) }));
+      if (req.method === 'GET' && url.pathname === '/api/events') return send(200, { events: await bus.events({ limit: Number(q.limit || 50), agent: q.agent, token: agentTokenOf(req, {}, q) }) });
+      if (req.method === 'GET' && url.pathname === '/api/sync') return send(200, await bus.sync({ sinceSeq: Number(q.sinceSeq || 0), limit: Number(q.limit || 500), agent: q.agent, token: agentTokenOf(req, {}, q) }));
       if (req.method === 'GET' && url.pathname === '/api/capsules') return send(200, { capsules: await bus.listCapsules() });
       const capsuleGet = url.pathname.match(/^\/api\/capsules\/([a-z0-9-]+)$/);
       if (req.method === 'GET' && capsuleGet) return send(200, await bus.getCapsule(capsuleGet[1], { create: q.create === '1', by: q.agent || null }));
@@ -349,7 +378,9 @@ export function createBusHandler({ id = 'default', bus, key = '' }) {
 
       return send(404, { error: 'not found' });
     } catch (e) {
-      return send(400, { error: e.message, code: e.code || undefined });
+      const status = statusForError(e);
+      if (status === 500) { process.stderr.write(`ghostbus: internal error: ${(e && e.stack) || e}\n`); return send(500, { error: 'internal error', code: e.code || undefined }); }
+      return send(status, { error: e.message, code: e.code || undefined });
     }
   };
 }

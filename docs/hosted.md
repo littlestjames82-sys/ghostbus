@@ -31,6 +31,9 @@ curl -X DELETE localhost:8388/api/workspaces/acme -H 'x-bus-key: <admin>'
 # stops working immediately (no restart, no grace period)
 curl -X POST localhost:8388/api/workspaces/acme/rotate-key -H 'x-bus-key: <admin>'
 
+# an agent lost its token (v0.6.0): issue a new one; the old token dies immediately, the new one is shown once
+curl -X POST localhost:8388/api/workspaces/acme/agents/builder/reset-token -H 'x-bus-key: <admin>'
+
 # export a workspace's full state (agents, messages, tasks, files, capsules,
 # context, event log) as one JSON envelope — for backup or moving hosts.
 # The export never contains the workspace key (only its hash exists, and
@@ -295,6 +298,14 @@ Abuse limits an operator can tune (environment variables):
 | `GHOSTBUS_HEADERS_TIMEOUT_MS` | 10000 | deadline for a client to deliver complete request headers |
 | `GHOSTBUS_REQUEST_TIMEOUT_MS` | 30000 | deadline to deliver a declared request body (never bounds a response — SSE and long-poll outlive it by design) |
 | `GHOSTBUS_RATE_LIMIT_PER_MIN` | 300 | per-IP, per-workspace request budget (the v0.4 limiter, now tunable) |
+| `GHOSTBUS_TRUSTED_PROXIES` | (none) | comma-separated proxy IPs and/or `loopback`; `X-Forwarded-For` is honoured **only** from these peers so the rate limiter sees real client IPs behind a reverse proxy (v0.6.0) |
+| `GHOSTBUS_ALLOW_QUERY_TOKEN` | allowed | `0` refuses `?token=` on REST routes (it appears in logs); `/api/stream` and `/api/wait` still accept it (v0.6.0) |
+| `GHOSTBUS_MAX_TASKS` | 5000 | per-workspace task cap; finished tasks nothing still depends on are pruned first, else `507` (v0.6.0) |
+| `GHOSTBUS_MAX_FILES` | 1000 | per-workspace shared-file cap → `507` |
+| `GHOSTBUS_MAX_AGENTS` | 200 | per-workspace agent cap → `507` |
+| `GHOSTBUS_MAX_COMMENTS_PER_TASK` | 500 | comments per task → `507` |
+| `GHOSTBUS_MAX_FILE_BYTES` | 1000000 | one shared file's size → `413` |
+| `GHOSTBUS_MAX_CONTEXT_BYTES` | 262144 | published context size → `413` |
 
 When to scale out: one process serving a handful of team-sized workspaces
 is the design point. If a single workspace's sustained op rate or state

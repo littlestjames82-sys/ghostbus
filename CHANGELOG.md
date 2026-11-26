@@ -1,14 +1,45 @@
 # Changelog
 
-## 0.5.12 — 2026-11-09
+## 0.6.0 — 2026-11-25
 
-Directory-scoring and completeness release — the tool surface now describes itself the way directory inspectors grade it, and the one entry point that was missing its bin ships.
+Review-driven release: one confidentiality fix, one data-loss fix, quotas, accurate HTTP statuses, token hygiene, and the fixes from the brief. The MCP tool surface only gains optional parameters; **the behavior changes are listed under "Upgrade notes" — read them before deploying.** This release folds in the earlier 0.5.12 work (priority validation and caps), which was never published.
 
-- **Tool annotations and fuller descriptions on all 29 tools** — every tool now carries MCP annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`), a fuller purpose description, and a description on every parameter. This is the metadata Glama's TDQS grades a server on (purpose clarity, usage guidelines, behavioral transparency, parameter semantics). Tool names, input schemas, and behavior are unchanged.
-- **`ghostbus-hosted` bin restored** — the hosted server was the only entry point without a `bin` entry in `package.json`; all four entry points (`ghostbus`, `ghostbus-cli`, `ghostbus-hosted`, `ghostbus-relay`) now ship as installable commands.
-- **Root Dockerfile for the stdio server** — directory builds that containerize a repo (Glama) get a standard root Dockerfile; the example client config was modernized alongside it.
-- **Repo hygiene (GitHub tree only, not in the tarball)** — CodeQL scanning added with a least-privilege CI token; the README leads with the npm (npx) launch and gained per-client install sections for eight MCP clients (Claude Desktop, Claude Code, Cursor, VS Code, Cline, Codex, Goose, Windsurf).
-- **Tests** — main suite **71 checks**, serverless **12**, both demos green, pack gate green; verified from a fresh checkout of main before release.
+### Security
+- **Fixed: direct messages were readable by other agents on token-enforcing buses.** `bus_search`, `bus_thread`, `bus_sync`, `bus_events`, `GET /api/search|events|sync`, `/api/stream` and `/api/wait` ignored agent identity, and the stream/long-poll routes trusted an unauthenticated `?agent=` name. With tokens enforced, these paths now use a verified identity: unproven callers see broadcasts only, DM `excerpt`s are stripped from the events they receive, an invisible thread root is "not found", and stream/wait require the agent's token (`401`). Participants still see their own DMs. The four read tools gain optional `agent`/`token` parameters. Buses that do not enforce tokens are unchanged (there is no identity to protect).
+- **Fixed: a corrupt or unreadable store file was silently replaced by an empty workspace.** `FileStore.load()` returned "no state" for every error, so the next write destroyed the data. Only a missing or empty file now means "new"; anything else raises `STORE_CORRUPT` / `STORE_UNREADABLE` (HTTP 500, generic body, details on stderr) and the file is left untouched.
+- **Query-string tokens deprecated.** `?token=` is still accepted but flagged with `Deprecation` and `Warning` headers on REST routes, and refused there when `GHOSTBUS_ALLOW_QUERY_TOKEN=0`. `/api/stream` and `/api/wait` keep accepting it because `EventSource` cannot set headers.
+- **Operator recovery for a lost agent token.** New `operatorResetAgentToken`, exposed only as `ghostbus-cli reset-token <agent>` (store-file access) and the hosted/serverless admin route `POST /api/workspaces/<id>/agents/<name>/reset-token` (admin key). Not an MCP tool and not on the agent-facing REST surface. The old token dies immediately, the new one is shown once, and an `agent.token_reset` event is logged.
+- **Fixed: agent `role` was uncapped on rejoin** (non-strings stored as-is). Now stringified and capped at 200, like first registration.
+- **Hardened: shared-file path length** capped at 256 characters.
+
+### Robustness
+- **Per-workspace quotas**, env-tunable (`GHOSTBUS_MAX_TASKS` 5000, `_FILES` 1000, `_AGENTS` 200, `_COMMENTS_PER_TASK` 500, `_FILE_BYTES` 1000000, `_CONTEXT_BYTES` 262144; also `opts.limits` per bus). At the task cap, the oldest finished tasks that no live task depends on are pruned (5% headroom, one `task.prune` event); if everything is live the create is refused. Other caps refuse with `QUOTA` (507) or `TOO_LARGE` (413). Overwriting an existing file and rejoining an existing agent are never blocked by the file/agent caps.
+- **Fixed: write amplification on `bus_list_tasks`.** Every list call rewrote the whole store; it now saves only when a claim lease actually expired.
+- **State file is written as compact JSON** (about a third smaller, less CPU per save). Old pretty-printed files load unchanged.
+- **Rate limiter behind a reverse proxy.** `GHOSTBUS_TRUSTED_PROXIES` (IPs and/or `loopback`) makes the limiter key on the real client via `X-Forwarded-For`, honoured only from those peers (right-most untrusted hop; an untrusted peer cannot spoof it). Default behavior is unchanged.
+- **A failed `createTask` no longer burns a task id** (validation now runs before the id is allocated).
+
+### Fixed (from the brief)
+- **`priority` was silently clamped.** Any value other than `"urgent"` became `"normal"`, so `POST /api/tasks` with `priority: "high"` came back `normal` with a 200 (the loss was in the core, not the REST path). Priority is now validated: missing/null → `normal`, case-insensitive `normal`/`urgent`, anything else → error (`400` over REST, `isError` over MCP).
+
+### Changed: accurate HTTP statuses (single relay, hosted, serverless)
+`401` agent-token failures (`AGENT_AUTH`), `404` not found, `409` state conflicts (`CONFLICT`, `ALREADY_CLAIMED`, `BLOCKED`), `413` too large, `507` quota, `500` storage faults. Validation errors and unknown-agent references stay `400`. Responses keep the same JSON shape (`error`, `code`).
+
+### Upgrade notes (behavior changes)
+1. **Status codes:** clients that treated every failure as `400` must now handle `401/404/409/413/507`. Error bodies are unchanged.
+2. **Unknown priorities are rejected** instead of downgraded.
+3. **Token-enforcing buses:** any client that streams, long-polls, or searches/syncs on behalf of an agent must send that agent's token (header preferred) or it will see broadcasts only, and `/api/stream` / `/api/wait` return `401` without it.
+4. **Quotas apply by default** at the generous limits above; raise them with the `GHOSTBUS_MAX_*` variables if a workspace legitimately exceeds them.
+5. A corrupt store file now stops the server with an error instead of starting empty — restore from backup or move the file aside.
+
+### Tests
+Main suite **81 checks** (+10: priority, role/path caps, no-write-on-list, quotas, DM confidentiality on every read path, SSE/long-poll auth and live redaction, status codes, query-token deprecation + trusted-proxy IPs, operator reset, store-corruption safety), serverless **12** (updated for the new statuses), both demos and the pack gate green.
+
+### Review notes — not changed (maintainer's call)
+- **Whole-state rewrite per operation** is still O(state size); compact JSON and the quotas bound it but do not remove it. An append-only journal or a real database is the fix once measured load demands it (the load bench is the place to decide).
+- **Any holder of the workspace key can still read broadcast content and all task/file/context data**; tokens separate *agents*, not data classes. If per-agent file or task privacy matters, that needs an ACL design, not a patch.
+- **No token recovery for the single relay over HTTP by design** — recovery is store-file (CLI) or hosted admin only.
+- **Registration is first-come:** any key-holder can claim an unused agent name.
 
 ## 0.5.11 — 2026-11-04
 

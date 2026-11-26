@@ -42,7 +42,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { createBus, FileStore, GHOSTBUS_VERSION, validateSnapshot } from './core.mjs';
-import { createBusHandler, keyMatches, hashMatches, readJsonBody, MAX_BODY_BYTES, HTML_SECURITY_HEADERS, applyServerTimeouts, SERVER_TIMEOUT_DEFAULTS } from './handler.mjs';
+import { createBusHandler, clientIp, keyMatches, hashMatches, readJsonBody, MAX_BODY_BYTES, HTML_SECURITY_HEADERS, applyServerTimeouts, SERVER_TIMEOUT_DEFAULTS } from './handler.mjs';
 
 const argv = process.argv.slice(2);
 const argVal = (flag) => { const i = argv.indexOf(flag); return i >= 0 ? argv[i + 1] : null; };
@@ -143,7 +143,6 @@ const wsKeyOk = (req, meta) => {
 const AUTH_FAIL_LIMIT = 30;            // failed auth attempts per window per IP
 const AUTH_FAIL_WINDOW_MS = 60_000;    // one-minute window
 const authFails = new Map(); // ip -> {start, count}
-const clientIp = (req) => (req.socket && req.socket.remoteAddress) || 'unknown';
 const authThrottled = (ip) => {
   const b = authFails.get(ip);
   return !!b && Date.now() - b.start <= AUTH_FAIL_WINDOW_MS && b.count >= AUTH_FAIL_LIMIT;
@@ -247,6 +246,17 @@ const server = http.createServer(async (req, res) => {
       if (cached) cached.meta = reg.workspaces[id];
       audit('rotate-key', id, req);
       return send(200, { id, key, keyNote: 'New workspace key — shown ONCE. The previous key is invalid from this moment.', keyRotatedAt: reg.workspaces[id].keyRotatedAt });
+    }
+    // Operator recovery for a lost agent token (v0.6.0): admin key only, never on the workspace
+    // surface. The old token dies at once; the new one is shown once; the action is audited.
+    const resetTokMatch = url.pathname.match(/^\/api\/workspaces\/([a-z0-9-]+)\/agents\/([A-Za-z0-9][A-Za-z0-9._-]{0,63})\/reset-token$/);
+    if (req.method === 'POST' && resetTokMatch) {
+      if (!isAdmin(req)) return adminDenied();
+      const [, id, agentName] = resetTokMatch;
+      const w = await getWorkspace(id);
+      if (!w) return send(404, { error: `no such workspace: ${id}` });
+      try { const r = await w.bus.operatorResetAgentToken({ name: agentName }); audit('reset-agent-token', id, req); return send(200, r); }
+      catch (e) { return send(e && e.code === 'UNKNOWN_AGENT' ? 404 : 400, { error: e.message, code: e.code || undefined }); }
     }
     const exportMatch = url.pathname.match(/^\/api\/workspaces\/([a-z0-9-]+)\/export$/);
     if (req.method === 'GET' && exportMatch) {

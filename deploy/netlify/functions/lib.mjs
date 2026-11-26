@@ -23,7 +23,7 @@
  * are documented in docs/hosted.md, not silent.
  */
 import crypto from 'node:crypto';
-import { GhostBus, GHOSTBUS_VERSION, validateSnapshot } from '../../../src/core.mjs';
+import { GhostBus, GHOSTBUS_VERSION, validateSnapshot, statusForError } from '../../../src/core.mjs';
 import { TOOLS, callTool } from '../../../src/tools.mjs';
 
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
@@ -106,6 +106,13 @@ export function createHostedCore({ kv, adminKey, requireTokens = true }) {
           // refresh (the Node server additionally refreshes its cached meta).
           return json(200, { id, key, keyNote: 'New workspace key — shown ONCE. The previous key is invalid from this moment.', keyRotatedAt: reg.workspaces[id].keyRotatedAt });
         }
+        if (req.method === 'POST' && parts[2] && parts[3] === 'agents' && parts[4] && parts[5] === 'reset-token') {
+          const id = parts[2];
+          const meta = reg.workspaces[id];
+          if (!meta) return json(404, { error: `no such workspace: ${id}` });
+          try { const r = await (await busFor(id, meta)).operatorResetAgentToken({ name: decodeURIComponent(parts[4]) }); audit('reset-agent-token', id, req); return json(200, r); }
+          catch (e) { return json(e && e.code === 'UNKNOWN_AGENT' ? 404 : 400, { error: e.message, code: e.code || undefined }); }
+        }
         if (req.method === 'GET' && parts[2] && parts[3] === 'export') {
           const id = parts[2];
           const meta = reg.workspaces[id];
@@ -187,7 +194,7 @@ export function createHostedCore({ kv, adminKey, requireTokens = true }) {
         if (req.method === 'POST' && R('/api/messages')) return json(200, await bus.sendMessage({ from: body.agent, to: body.to ?? '*', body: body.body, channel: body.channel ?? 'general', threadId: body.threadId ?? null, token: tk }));
         if (req.method === 'GET' && R('/api/inbox')) return json(200, { messages: await bus.inbox(q.agent, { unreadOnly: q.unread === '1', limit: Number(q.limit || 50), token: tk }) });
         if (req.method === 'POST' && R('/api/heartbeat')) return json(200, await bus.heartbeat({ name: body.agent, token: tk }));
-        if (req.method === 'GET' && R('/api/search')) return json(200, await bus.search(q.q || '', { limit: Number(q.limit || 20) }));
+        if (req.method === 'GET' && R('/api/search')) return json(200, await bus.search(q.q || '', { limit: Number(q.limit || 20), agent: q.agent, token: tk }));
         if (req.method === 'GET' && R('/api/channels')) return json(200, { channels: await bus.listChannels() });
         if (req.method === 'POST' && R('/api/tasks')) return json(200, await bus.createTask({ from: body.agent, title: body.title, body: body.body ?? '', assignee: body.assignee ?? null, priority: body.priority ?? 'normal', needsApproval: !!body.needsApproval, blockedBy: body.blockedBy ?? [], token: tk }));
         if (req.method === 'GET' && R('/api/tasks')) return json(200, { tasks: await bus.listTasks({ status: q.status || null, assignee: q.assignee || null }) });
@@ -208,8 +215,8 @@ export function createHostedCore({ kv, adminKey, requireTokens = true }) {
         if (req.method === 'PUT' && R('/api/context')) return json(200, await bus.putContext({ by: body.agent, context: body.context, token: tk }));
         if (req.method === 'GET' && R('/api/context')) return json(200, await bus.getContext());
         if (req.method === 'GET' && R('/api/board')) return json(200, { board: await bus.board() });
-        if (req.method === 'GET' && R('/api/events')) return json(200, { events: await bus.events({ limit: Number(q.limit || 50) }) });
-        if (req.method === 'GET' && R('/api/sync')) return json(200, await bus.sync({ sinceSeq: Number(q.sinceSeq || 0), limit: Number(q.limit || 500) }));
+        if (req.method === 'GET' && R('/api/events')) return json(200, { events: await bus.events({ limit: Number(q.limit || 50), agent: q.agent, token: tk }) });
+        if (req.method === 'GET' && R('/api/sync')) return json(200, await bus.sync({ sinceSeq: Number(q.sinceSeq || 0), limit: Number(q.limit || 500), agent: q.agent, token: tk }));
         if (req.method === 'GET' && R('/api/capsules')) return json(200, { capsules: await bus.listCapsules() });
         const cg = rest.match(/^\/api\/capsules\/([a-z0-9-]+)$/);
         if (req.method === 'GET' && cg) return json(200, await bus.getCapsule(cg[1], { create: q.create === '1', by: q.agent || null }));
@@ -220,7 +227,9 @@ export function createHostedCore({ kv, adminKey, requireTokens = true }) {
 
       return json(404, { error: 'not found' });
     } catch (e) {
-      return json(400, { error: e.message, code: e.code || undefined });
+      const status = statusForError(e);
+      if (status === 500) return json(500, { error: 'internal error', code: e.code || undefined });
+      return json(status, { error: e.message, code: e.code || undefined });
     }
   };
 }

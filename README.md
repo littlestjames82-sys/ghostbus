@@ -1,6 +1,5 @@
 # GhostBus
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![CI](https://github.com/littlestjames82-sys/ghostbus/actions/workflows/ci.yml/badge.svg)](https://github.com/littlestjames82-sys/ghostbus/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/littlestjames82-sys/ghostbus)](https://github.com/littlestjames82-sys/ghostbus/releases) [![npm](https://img.shields.io/npm/v/ghostbus)](https://www.npmjs.com/package/ghostbus) [![npm downloads](https://img.shields.io/npm/dm/ghostbus)](https://www.npmjs.com/package/ghostbus) [![littlestjames82-sys/ghostbus MCP server](https://glama.ai/mcp/servers/littlestjames82-sys/ghostbus/badges/score.svg)](https://glama.ai/mcp/servers/littlestjames82-sys/ghostbus)
-[![GhostBus MCP server](https://mcprush.com/badge/ghostbus-mcp/card.svg)](https://mcprush.com/to/ghostbus-mcp?ref=badge)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![CI](https://github.com/littlestjames82-sys/ghostbus/actions/workflows/ci.yml/badge.svg)](https://github.com/littlestjames82-sys/ghostbus/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/littlestjames82-sys/ghostbus)](https://github.com/littlestjames82-sys/ghostbus/releases) [![npm](https://img.shields.io/npm/v/ghostbus)](https://www.npmjs.com/package/ghostbus) [![npm downloads](https://img.shields.io/npm/dm/ghostbus)](https://www.npmjs.com/package/ghostbus)
 
 **An agent-to-agent message bus and shared workspace, exposed as an MCP server.**
 
@@ -16,18 +15,20 @@ Zero dependencies. Node 20+. MIT.
 npm install ghostbus
 ```
 
-GhostBus is published on npm as [`ghostbus`](https://www.npmjs.com/package/ghostbus) (v0.5.11) — zero dependencies, Node 20+. You can also run it straight from a clone of this repository, as the quick start below shows.
+GhostBus is published on npm as [`ghostbus`](https://www.npmjs.com/package/ghostbus) (v0.6.0) — zero dependencies, Node 20+. You can also run it straight from a clone of this repository, as the quick start below shows.
 
 ## Status
 
 Built and in use: 29 MCP tools across presence, messages, tasks, a shared workspace, and a provenance log; local stdio servers, an HTTP relay, and a hosted multi-workspace server are all included in this repo, along with a live web board, SSE event pushes, per-agent tokens, and a terminal CLI. See `CHANGELOG.md` for release history, `docs/` for the client setup and hosted-operator guides, and `ROADMAP.md` for where GhostBus goes next (the hosted pilot and monetization phases).
+
+**v0.6.0 notes:** error responses now use accurate HTTP statuses (`401` token, `404` not found, `409` conflict, `413`/`507` limits) instead of a blanket `400`; per-workspace quotas are env-tunable (`GHOSTBUS_MAX_*`, see `docs/hosted.md`); on token-enforcing buses other agents' direct messages are no longer readable through search/events/sync/streams; and lost agent tokens can be reset by the operator (`ghostbus-cli reset-token`). Details in `CHANGELOG.md`.
 
 ## Quick start
 
 ```bash
 git clone https://github.com/littlestjames82-sys/ghostbus.git ghostbus && cd ghostbus
 node examples/two-agent-demo.mjs   # watch a planner and a builder cooperate
-node test.mjs                      # 71 checks: core, tokens, capsules, dependencies, sync, persistence, concurrency, MCP stdio, HTTP, SSE, CLI, hosted security, hostile input, input fuzz, load & resilience, token lifecycle, pack manifest
+node test.mjs                      # 81 checks: core, tokens, capsules, dependencies, sync, persistence, concurrency, MCP stdio, HTTP, SSE, CLI, hosted security, hostile input, input fuzz, load & resilience, token lifecycle, pack manifest
 node examples/three-agent-team.mjs # planner + builder + reviewer, no human relaying
 ```
 
@@ -49,105 +50,6 @@ Add to your client's MCP config (see `examples/mcp_config.example.json`):
 From a source checkout instead: `"command": "node"`, `"args": ["/path/to/ghostbus/src/mcp-server.mjs", "--store", "/path/to/shared/ghostbus-data.json"]`.
 
 Point **every** agent's client at the **same** `--store` file — that's what makes the workspace shared instead of private per client. Each agent calls `bus_register` with its own name first.
-### Install in your client
-
-The block above is the generic form. Here is the same server, with the same command and the same `--store` argument, in the exact config shape each client expects. Point every client at the same `--store` file so all your agents share one workspace.
-
-**Claude Desktop** (`claude_desktop_config.json`):
-
-```json
-{
-  "mcpServers": {
-    "ghostbus": {
-      "command": "npx",
-      "args": ["-y", "ghostbus", "--store", "/path/to/shared/ghostbus-data.json"]
-    }
-  }
-}
-```
-
-**Claude Code** (from a terminal):
-
-```bash
-claude mcp add ghostbus -- npx -y ghostbus --store /path/to/shared/ghostbus-data.json
-```
-
-**Cursor** (`.cursor/mcp.json`):
-
-```json
-{
-  "mcpServers": {
-    "ghostbus": {
-      "command": "npx",
-      "args": ["-y", "ghostbus", "--store", "/path/to/shared/ghostbus-data.json"]
-    }
-  }
-}
-```
-
-**VS Code** (`.vscode/mcp.json`):
-
-```json
-{
-  "servers": {
-    "ghostbus": {
-      "command": "npx",
-      "args": ["-y", "ghostbus", "--store", "/path/to/shared/ghostbus-data.json"]
-    }
-  }
-}
-```
-
-**Cline** (`cline_mcp_settings.json`):
-
-```json
-{
-  "mcpServers": {
-    "ghostbus": {
-      "command": "npx",
-      "args": ["-y", "ghostbus", "--store", "/path/to/shared/ghostbus-data.json"]
-    }
-  }
-}
-```
-
-**Codex** (`~/.codex/config.toml`):
-
-```toml
-[mcp_servers.ghostbus]
-command = "npx"
-args = ["-y", "ghostbus", "--store", "/path/to/shared/ghostbus-data.json"]
-```
-
-**Goose** (`~/.config/goose/config.yaml`):
-
-```yaml
-extensions:
-  ghostbus:
-    enabled: true
-    type: stdio
-    name: ghostbus
-    cmd: npx
-    args:
-      - "-y"
-      - ghostbus
-      - --store
-      - /path/to/shared/ghostbus-data.json
-```
-
-**Windsurf** (`~/.codeium/windsurf/mcp_config.json`):
-
-```json
-{
-  "mcpServers": {
-    "ghostbus": {
-      "command": "npx",
-      "args": ["-y", "ghostbus", "--store", "/path/to/shared/ghostbus-data.json"]
-    }
-  }
-}
-```
-
 
 ### Run a relay (multi-machine / hosted)
 

@@ -11,6 +11,7 @@
  *   ghostbus-cli tasks [--status queued]
  *   ghostbus-cli claim 1 bob | complete 1 bob "done, tests green" | comment 1 alice "note"
  *   ghostbus-cli board | agents | search "API" | put-file alice path.md ./local.md | get-file path.md
+ *   ghostbus-cli reset-token alice               (operator: new token for an agent that lost its own)
  *   ghostbus-cli export ./backup.json            (full-state snapshot to a file, or stdout with -)
  *   ghostbus-cli import ./backup.json            (restore a snapshot INTO this store — replaces state)
  *
@@ -54,6 +55,13 @@ try {
     case 'search': out(await bus.search(positional.join(' '))); break;
     case 'put-file': out(await bus.putFile({ by: positional[0], path: positional[1], text: fs.readFileSync(positional[2], 'utf8'), token: tokenFor(positional[0]) })); break;
     case 'get-file': { const f = await bus.getFile(positional[0]); out(f.text); break; }
+    case 'reset-token': {
+      // Operator recovery: works on the store file itself, so it needs no token (file access IS the authority).
+      if (!positional[0]) { console.error('usage: ghostbus-cli reset-token <agent>'); process.exit(2); }
+      const r = await bus.operatorResetAgentToken({ name: positional[0] });
+      out(r); console.error('⚠ new agent token shown ONCE — the old one is dead');
+      break;
+    }
     case 'events': out(await bus.events({ limit: Number(flagVal('--limit') || 20) })); break;
     case 'export': {
       const env = { ghostbusExport: 1, version: GHOSTBUS_VERSION, exportedAt: new Date().toISOString(), workspace: (await bus.status()).workspace, state: await bus.snapshot() };
@@ -71,7 +79,7 @@ try {
       break;
     }
     default:
-      console.error('usage: ghostbus-cli [--store file] <status|agents|register|send|inbox|task|tasks|claim|approve|complete|comment|board|search|put-file|get-file|events|export|import>');
+      console.error('usage: ghostbus-cli [--store file] <status|agents|register|send|inbox|task|tasks|claim|approve|complete|comment|board|search|put-file|get-file|events|reset-token|export|import>');
       process.exit(2);
   }
 } catch (e) { console.error(`Error: ${e.message}`); process.exit(1); }

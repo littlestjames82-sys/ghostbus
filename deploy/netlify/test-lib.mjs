@@ -75,7 +75,7 @@ await check('parity: agent token rotates over plain REST — old token dies at o
   assert.ok(soloToken2 && soloToken2 !== soloToken);
   // the OLD token is refused on the very next request (stateless: the
   // persisted hash was replaced before the rotation replied)
-  assert.equal((await call('POST', '/w/one/api/tasks', { key: keyOne, body: { agent: 'solo', title: 'old token', token: soloToken } })).status, 400);
+  assert.equal((await call('POST', '/w/one/api/tasks', { key: keyOne, body: { agent: 'solo', title: 'old token', token: soloToken } })).status, 401);
   assert.equal((await call('POST', '/w/one/api/tasks', { key: keyOne, body: { agent: 'solo', title: 'new token', token: soloToken2 } })).status, 200);
 });
 await check('parity: core hardening flows through the shared code (reserved file names, limit clamps)', async () => {
@@ -118,7 +118,7 @@ await check('parity: enforcement is the DEFAULT (no requireTokens passed) — to
   const reg = await call2('POST', '/w/fresh/api/agents', { key: k, body: { agent: 'newbie' } });
   assert.equal(reg.status, 200);
   const tok = (await reg.json()).token;
-  assert.equal((await call2('POST', '/w/fresh/api/messages', { key: k, body: { agent: 'newbie', to: '*', body: 'tokenless' } })).status, 400);
+  assert.equal((await call2('POST', '/w/fresh/api/messages', { key: k, body: { agent: 'newbie', to: '*', body: 'tokenless' } })).status, 401);
   assert.equal((await call2('POST', '/w/fresh/api/messages', { key: k, body: { agent: 'newbie', to: '*', body: 'with token', token: tok } })).status, 200);
 });
 await check('parity: export -> import across cores — fresh key, hashes only, deep validation shared', async () => {

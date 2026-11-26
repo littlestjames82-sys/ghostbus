@@ -14,7 +14,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 
-export const GHOSTBUS_VERSION = '0.5.12';
+export const GHOSTBUS_VERSION = '0.6.0';
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 // Timing-safe equality for hex digests (v0.5.3): secret comparisons must not
 // short-circuit on the first differing character the way === does.
@@ -35,6 +35,31 @@ const CLAIM_LEASE_MS = 15 * 60 * 1000;
 const RESERVED_FILE_NAMES = new Set(['__proto__', 'constructor', 'prototype']);
 
 const now = () => new Date().toISOString();
+// Coded errors (v0.6.0): the HTTP layer maps `code` to a status (401 AGENT_AUTH,
+// 404 NOT_FOUND, 409 CONFLICT, 413 TOO_LARGE, 507 QUOTA). Uncoded = validation = 400.
+const fail = (message, code) => Object.assign(new Error(message), { code });
+// HTTP status for a bus error (v0.6.0). Before this every failure was a 400, so clients could not
+// tell "fix your request" from "not found", "conflict", "quota" or "the server is broken".
+export function statusForError(e) {
+  const c = e && e.code;
+  if (c === 'AGENT_AUTH') return 401;
+  if (c === 'NOT_FOUND') return 404;
+  if (c === 'CONFLICT' || c === 'ALREADY_CLAIMED' || c === 'BLOCKED') return 409;
+  if (c === 'TOO_LARGE') return 413;
+  if (c === 'QUOTA') return 507;
+  if (typeof c === 'string' && (c.startsWith('STORE_') || /^E[A-Z0-9]{2,}$/.test(c))) return 500; // storage/OS faults
+  return 400;
+}
+const envInt = (name, def) => { const n = Number(process.env[name]); return Number.isFinite(n) && n >= 1 ? Math.floor(n) : def; };
+// Per-workspace quotas (v0.6.0). Operator knobs via env; `opts.limits` overrides per bus.
+export const defaultLimits = () => ({
+  maxTasks: envInt('GHOSTBUS_MAX_TASKS', 5000),
+  maxFiles: envInt('GHOSTBUS_MAX_FILES', 1000),
+  maxCommentsPerTask: envInt('GHOSTBUS_MAX_COMMENTS_PER_TASK', 500),
+  maxAgents: envInt('GHOSTBUS_MAX_AGENTS', 200),
+  maxFileBytes: envInt('GHOSTBUS_MAX_FILE_BYTES', 1_000_000),
+  maxContextBytes: envInt('GHOSTBUS_MAX_CONTEXT_BYTES', 262_144),
+});
 const clone = (v) => JSON.parse(JSON.stringify(v));
 // Untrusted numeric inputs (HTTP query params, MCP arguments, direct API
 // callers) arrive as NaN, negatives, and absurd magnitudes, and raw
@@ -78,8 +103,18 @@ export class MemoryStore {
 export class FileStore {
   constructor(file) { this.file = file; this.shared = true; this._chain = Promise.resolve(); }
   async load() {
-    try { return JSON.parse(await fs.promises.readFile(this.file, 'utf8')); }
-    catch { return null; }
+    // v0.6.0: only "file does not exist" (or empty) means "no state yet". Any other
+    // failure used to return null, so a corrupt/unreadable store was silently replaced
+    // by an empty workspace on the next save — data loss. Now it fails loudly instead.
+    let text;
+    try { text = await fs.promises.readFile(this.file, 'utf8'); }
+    catch (e) {
+      if (e && e.code === 'ENOENT') return null;
+      throw fail(`store unreadable: ${e && e.message}`, 'STORE_UNREADABLE');
+    }
+    if (!text.trim()) return null;
+    try { return JSON.parse(text); }
+    catch (e) { throw fail(`store is corrupt (not valid JSON): ${this.file} — refusing to overwrite it; restore from a backup or move the file aside`, 'STORE_CORRUPT'); }
   }
   async save(state) {
     // Serialize saves within this process, and give every save its own temp
@@ -93,7 +128,7 @@ export class FileStore {
         // State files hold token hashes — owner-only (0600) from birth
         // (v0.5.3). The mode rides through the atomic rename; the chmod
         // covers filesystems/umasks that would otherwise widen it.
-        await fs.promises.writeFile(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
+        await fs.promises.writeFile(tmp, JSON.stringify(state), { mode: 0o600 });
         await fs.promises.chmod(tmp, 0o600).catch(() => {});
         await fs.promises.rename(tmp, this.file); // atomic replace
       } finally {
@@ -114,6 +149,7 @@ export class GhostBus {
     // When true, every act by an agent that holds a token must present it.
     // Registration issues the token once; only its sha256 is stored.
     this.requireTokens = !!opts.requireTokens;
+    this.limits = { ...defaultLimits(), ...(opts.limits || {}) };
     this.listeners = new Set(); // live event subscribers (SSE relay)
     // Mutation mutex (v0.5.1): a promise chain serializing every public
     // operation's load -> mutate -> save cycle on THIS instance. Without it,
@@ -177,6 +213,29 @@ export class GhostBus {
 
   _agent(name) { return this.state.agents.find(a => a.name === name) || null; }
 
+  // ---- direct-message visibility (v0.6.0) ----
+  // With tokens enforced, an agent's identity is only proven by its token. Read paths that
+  // return message content (search, thread, sync, events, SSE, long-poll) used to ignore
+  // identity and exposed every agent's direct messages to any key-holder. When enforced,
+  // `viewer` is the verified agent name, or null (unproven: broadcasts only). When tokens
+  // are NOT enforced there is no identity to protect, so viewer is undefined = no filtering.
+  _viewerOf(agent, token) {
+    if (!this.requireTokens) return undefined;
+    const a = agent ? this._agent(String(agent)) : null;
+    if (!a) return null;
+    if (!a.tokenHash) return a.name;
+    return token && hashEqHex(sha256(token), a.tokenHash) ? a.name : null;
+  }
+  _canSee(m, viewer) { return viewer === undefined || m.to === '*' || m.to === viewer || m.from === viewer; }
+  _redactEvent(ev, viewer) {
+    if (viewer === undefined || ev.type !== 'message.send' || ev.to === '*' || ev.to === viewer || ev.actor === viewer) return ev;
+    const { excerpt, ...rest } = ev; return rest;
+  }
+  /** True when `token` proves `name` (always true on a non-enforcing bus). */
+  async verifyAgent(name, token = null) { await this.init(); return this._viewerOf(name, token) !== null; }
+  /** Strip DM excerpts the agent may not read (no-op unless tokens are enforced). Sync; for SSE/long-poll. */
+  redactEvent(ev, agent) { return this.requireTokens ? this._redactEvent(ev, agent) : ev; }
+
   _publicAgent(a) {
     const { tokenHash, ...pub } = a;
     return { ...pub, online: Date.now() - Date.parse(a.lastSeenAt) < 120_000, hasToken: !!tokenHash };
@@ -213,13 +272,14 @@ export class GhostBus {
       if (this.requireTokens && existing.tokenHash && (role || (Array.isArray(capabilities) && capabilities.length))) {
         this._requireAgent(name, token);
       }
-      existing.role = role || existing.role;
+      existing.role = role ? String(role).slice(0, 200) : existing.role;
       if (Array.isArray(capabilities) && capabilities.length) existing.capabilities = capabilities.map(String).slice(0, 32);
       existing.lastSeenAt = now();
       this._event('agent.rejoin', name, `${name} rejoined`);
       await this._save();
       return { agent: this._publicAgent(existing), rejoined: true };
     }
+    if (this.state.agents.length >= this.limits.maxAgents) throw fail(`agent quota reached (max ${this.limits.maxAgents} per workspace)`, 'QUOTA');
     const rawToken = crypto.randomBytes(24).toString('hex');
     const agent = { name, role: String(role).slice(0, 200), capabilities: Array.isArray(capabilities) ? capabilities.map(String).slice(0, 32) : [], joinedAt: now(), lastSeenAt: now(), tokenHash: sha256(rawToken) };
     this.state.agents.push(agent);
@@ -236,6 +296,24 @@ export class GhostBus {
     const rawToken = crypto.randomBytes(24).toString('hex');
     a.tokenHash = sha256(rawToken);
     this._event('agent.token_rotate', name, `${name} rotated its agent token`);
+    await this._save();
+    return { agent: this._publicAgent(a), token: rawToken, tokenNote: 'New token — the old one no longer works. Shown once.' };
+  }
+
+  /**
+   * Operator recovery (v0.6.0): issue a fresh token for an agent WITHOUT presenting the old
+   * one — for an agent that lost its token on an enforcing bus. Deliberately not an MCP tool
+   * and not on the agent-facing REST surface: reachable only by the CLI (store-file access)
+   * and the hosted admin API (admin key). The old token dies immediately; the event is logged.
+   */
+  async operatorResetAgentToken(...args) { return this._serialized(() => this._operatorResetAgentToken(...args)); }
+  async _operatorResetAgentToken({ name }) {
+    await this.init();
+    const a = this._agent(String(name || ''));
+    if (!a) throw Object.assign(new Error(`agent not registered: ${name}`), { code: 'UNKNOWN_AGENT' });
+    const rawToken = crypto.randomBytes(24).toString('hex');
+    a.tokenHash = sha256(rawToken);
+    this._event('agent.token_reset', 'operator', `operator reset the agent token for ${a.name}`);
     await this._save();
     return { agent: this._publicAgent(a), token: rawToken, tokenNote: 'New token — the old one no longer works. Shown once.' };
   }
@@ -292,11 +370,12 @@ export class GhostBus {
   }
 
   async thread(...args) { return this._serialized(() => this._thread(...args)); }
-  async _thread(id) {
+  async _thread(id, { agent = null, token = null } = {}) {
     await this.init();
+    const viewer = this._viewerOf(agent, token);
     const root = this.state.messages.find(m => m.id === Number(id));
-    if (!root) throw new Error(`message not found: ${id}`);
-    return clone(this.state.messages.filter(m => m.id === root.id || m.threadId === root.id));
+    if (!root || !this._canSee(root, viewer)) throw fail(`message not found: ${id}`, 'NOT_FOUND');
+    return clone(this.state.messages.filter(m => (m.id === root.id || m.threadId === root.id) && this._canSee(m, viewer)));
   }
 
   // ---------- tasks ----------
@@ -306,38 +385,64 @@ export class GhostBus {
     this._requireAgent(from, token);
     if (assignee) this._existsAgent(assignee);
     if (!title || !String(title).trim()) throw new Error('task title required');
+    // Reject unknown priorities instead of silently downgrading them (e.g. "high" used to become "normal").
+    const prio = priority == null ? 'normal' : String(priority).toLowerCase();
+    if (prio !== 'normal' && prio !== 'urgent') throw new Error(`priority must be "normal" or "urgent" (got ${JSON.stringify(String(priority).slice(0, 40))})`);
+    const deps = Array.isArray(blockedBy) ? blockedBy.map(Number).filter(n => n >= 1) : [];
+    for (const b of deps) if (!this.state.tasks.some(t => t.id === b)) throw new Error(`blocker task not found: ${b}`);
+    this._makeRoomForTask(deps);
     this.state.taskSeq += 1;
     const task = {
       id: this.state.taskSeq, title: String(title).slice(0, 300), body: String(body),
-      from, assignee: assignee || null, priority: priority === 'urgent' ? 'urgent' : 'normal',
+      from, assignee: assignee || null, priority: prio,
       status: needsApproval ? 'needs-approval' : 'queued',
       needsApproval: !!needsApproval, approvedBy: null,
-      claimedBy: null, claimExpiresAt: null, result: null, comments: [], blockedBy: Array.isArray(blockedBy) ? blockedBy.map(Number).filter(n => n >= 1) : [],
+      claimedBy: null, claimExpiresAt: null, result: null, comments: [], blockedBy: deps,
       createdAt: now(), updatedAt: now(),
       history: [{ at: now(), by: from, action: needsApproval ? 'created (awaiting approval)' : 'created' }],
     };
-    for (const b of task.blockedBy) if (!this.state.tasks.some(t => t.id === b)) throw new Error(`blocker task not found: ${b}`);
     this.state.tasks.push(task);
     this._event('task.create', from, `task #${task.id}: ${task.title}`);
     await this._save();
     return clone(task);
   }
 
+  // Task quota (v0.6.0): at the cap, the oldest finished (done/cancelled) tasks that no live
+  // task still names in blockedBy are pruned (5% headroom, one provenance event); if every
+  // task is live the create is refused with QUOTA instead of growing without bound.
+  _makeRoomForTask(protect = []) {
+    const max = this.limits.maxTasks; const tasks = this.state.tasks;
+    if (tasks.length < max) return;
+    const terminal = (t) => t.status === 'done' || t.status === 'cancelled';
+    const keep = new Set(protect);
+    for (const t of tasks) if (!terminal(t)) for (const b of t.blockedBy || []) keep.add(b);
+    const evictable = tasks.filter(t => terminal(t) && !keep.has(t.id));
+    const need = tasks.length - max + 1 + Math.floor(max * 0.05);
+    const drop = new Set(evictable.slice(0, need).map(t => t.id));
+    if (tasks.length - drop.size >= max) throw fail(`task quota reached (max ${max} per workspace, all still active)`, 'QUOTA');
+    this.state.tasks = tasks.filter(t => !drop.has(t.id));
+    this._event('task.prune', 'system', `pruned ${drop.size} finished task(s) at the ${max}-task quota`, { pruned: drop.size });
+  }
+
   _expireClaims() {
     const t = Date.now();
+    let changed = false;
     for (const task of this.state.tasks) {
       if (task.status === 'claimed' && task.claimExpiresAt && Date.parse(task.claimExpiresAt) < t) {
+        changed = true;
         task.status = 'queued'; task.claimedBy = null; task.claimExpiresAt = null; task.updatedAt = now();
         task.history.push({ at: now(), by: 'system', action: 'claim lease expired — returned to queue' });
         this._event('task.claim_expired', 'system', `task #${task.id} claim expired`);
       }
     }
+    return changed;
   }
 
   async listTasks(...args) { return this._serialized(() => this._listTasks(...args)); }
   async _listTasks({ status = null, assignee = null } = {}) {
     await this.init();
-    this._expireClaims(); await this._save();
+    // Persist only when a lease actually expired — polling listTasks must not rewrite the whole store each call.
+    if (this._expireClaims()) await this._save();
     let tasks = this.state.tasks;
     if (status) tasks = tasks.filter(t => t.status === status);
     if (assignee) tasks = tasks.filter(t => t.assignee === assignee || t.claimedBy === assignee);
@@ -349,7 +454,7 @@ export class GhostBus {
     await this.init();
     this._requireAgent(by, token);
     const task = this._task(id);
-    if (task.status !== 'needs-approval') throw new Error(`task #${id} is not awaiting approval (status: ${task.status})`);
+    if (task.status !== 'needs-approval') throw fail(`task #${id} is not awaiting approval (status: ${task.status})`, 'CONFLICT');
     task.status = 'queued'; task.approvedBy = by; task.updatedAt = now();
     task.history.push({ at: now(), by, action: 'approved' });
     this._event('task.approve', by, `task #${id} approved`);
@@ -365,8 +470,8 @@ export class GhostBus {
     this._expireClaims();
     const task = this._task(id);
     if (task.status === 'claimed') throw Object.assign(new Error(`task #${id} already claimed by ${task.claimedBy}`), { code: 'ALREADY_CLAIMED' });
-    if (task.status !== 'queued') throw new Error(`task #${id} cannot be claimed (status: ${task.status})`);
-    if (task.assignee && task.assignee !== by) throw new Error(`task #${id} is assigned to ${task.assignee}`);
+    if (task.status !== 'queued') throw fail(`task #${id} cannot be claimed (status: ${task.status})`, 'CONFLICT');
+    if (task.assignee && task.assignee !== by) throw fail(`task #${id} is assigned to ${task.assignee}`, 'CONFLICT');
     const openBlockers = (task.blockedBy || []).filter(bid => { const b = this.state.tasks.find(t => t.id === bid); return b && !['done', 'cancelled'].includes(b.status); });
     if (openBlockers.length) throw Object.assign(new Error(`task #${id} is blocked by unfinished task(s): ${openBlockers.join(', ')}`), { code: 'BLOCKED' });
     task.status = 'claimed'; task.claimedBy = by;
@@ -383,8 +488,8 @@ export class GhostBus {
     await this.init();
     this._requireAgent(by, token);
     const task = this._task(id);
-    if (task.status !== 'claimed') throw new Error(`task #${id} is not claimed (status: ${task.status})`);
-    if (task.claimedBy !== by) throw new Error(`task #${id} is claimed by ${task.claimedBy}, not ${by}`);
+    if (task.status !== 'claimed') throw fail(`task #${id} is not claimed (status: ${task.status})`, 'CONFLICT');
+    if (task.claimedBy !== by) throw fail(`task #${id} is claimed by ${task.claimedBy}, not ${by}`, 'CONFLICT');
     task.status = 'done'; task.result = String(result); task.claimExpiresAt = null; task.updatedAt = now();
     task.history.push({ at: now(), by, action: 'completed' });
     this._event('task.complete', by, `task #${id} completed`);
@@ -397,7 +502,7 @@ export class GhostBus {
     await this.init();
     this._requireAgent(by, token);
     const task = this._task(id);
-    if (['done', 'cancelled'].includes(task.status)) throw new Error(`task #${id} already ${task.status}`);
+    if (['done', 'cancelled'].includes(task.status)) throw fail(`task #${id} already ${task.status}`, 'CONFLICT');
     task.status = 'cancelled'; task.updatedAt = now();
     task.history.push({ at: now(), by, action: 'cancelled' });
     this._event('task.cancel', by, `task #${id} cancelled`);
@@ -407,7 +512,7 @@ export class GhostBus {
 
   _task(id) {
     const task = this.state.tasks.find(t => t.id === Number(id));
-    if (!task) throw new Error(`task not found: ${id}`);
+    if (!task) throw fail(`task not found: ${id}`, 'NOT_FOUND');
     return task;
   }
 
@@ -417,8 +522,11 @@ export class GhostBus {
     await this.init();
     this._requireAgent(by, token);
     if (typeof p !== 'string' || !p || typeof text !== 'string') throw new Error('path and text required');
+    if (p.length > 256) throw new Error('path too long (max 256 chars)');
     if (String(p).includes('..')) throw new Error('path may not contain ..');
     if (RESERVED_FILE_NAMES.has(p)) throw new Error('path is a reserved name');
+    if (Buffer.byteLength(text) > this.limits.maxFileBytes) throw fail(`file too large (max ${this.limits.maxFileBytes} bytes)`, 'TOO_LARGE');
+    if (!Object.prototype.hasOwnProperty.call(this.state.files, p) && Object.keys(this.state.files).length >= this.limits.maxFiles) throw fail(`file quota reached (max ${this.limits.maxFiles} files per workspace)`, 'QUOTA');
     const prev = this.state.files[p];
     const history = prev ? [...(prev.history || []), { text: prev.text, updatedBy: prev.updatedBy, updatedAt: prev.updatedAt }].slice(-10) : [];
     this.state.files[p] = { text, updatedBy: by, updatedAt: now(), history };
@@ -431,7 +539,7 @@ export class GhostBus {
   async _getFile(p, { withHistory = false } = {}) {
     await this.init();
     const f = Object.prototype.hasOwnProperty.call(this.state.files, p) ? this.state.files[p] : undefined;
-    if (!f) throw new Error(`file not found: ${p}`);
+    if (!f) throw fail(`file not found: ${p}`, 'NOT_FOUND');
     const { history, ...rest } = f;
     return { path: p, ...clone(rest), versions: (history || []).length + 1, ...(withHistory ? { history: clone(history || []) } : {}) };
   }
@@ -440,7 +548,7 @@ export class GhostBus {
   async _fileHistory(p) {
     await this.init();
     const f = Object.prototype.hasOwnProperty.call(this.state.files, p) ? this.state.files[p] : undefined;
-    if (!f) throw new Error(`file not found: ${p}`);
+    if (!f) throw fail(`file not found: ${p}`, 'NOT_FOUND');
     return { path: p, current: { text: f.text, updatedBy: f.updatedBy, updatedAt: f.updatedAt }, history: clone(f.history || []) };
   }
 
@@ -455,6 +563,7 @@ export class GhostBus {
     await this.init();
     this._requireAgent(by, token);
     if (!context || typeof context !== 'object' || Array.isArray(context)) throw new Error('context must be an object');
+    if (Buffer.byteLength(JSON.stringify(context)) > this.limits.maxContextBytes) throw fail(`context too large (max ${this.limits.maxContextBytes} bytes)`, 'TOO_LARGE');
     this.state.context = clone(context);
     this._event('context.put', by, `${by} published context`);
     await this._save();
@@ -464,7 +573,7 @@ export class GhostBus {
   async getContext(...args) { return this._serialized(() => this._getContext(...args)); }
   async _getContext() {
     await this.init();
-    if (!this.state.context) throw new Error('no context published yet');
+    if (!this.state.context) throw fail('no context published yet', 'NOT_FOUND');
     return clone(this.state.context);
   }
 
@@ -475,6 +584,7 @@ export class GhostBus {
     if (!body || !String(body).trim()) throw new Error('comment body required');
     const task = this._task(id);
     task.comments = task.comments || [];
+    if (task.comments.length >= this.limits.maxCommentsPerTask) throw fail(`comment quota reached for task #${task.id} (max ${this.limits.maxCommentsPerTask})`, 'QUOTA');
     const comment = { by, body: String(body), at: now() };
     task.comments.push(comment);
     task.updatedAt = now();
@@ -488,7 +598,7 @@ export class GhostBus {
   async _deleteFile({ by, path: p, token = null }) {
     await this.init();
     this._requireAgent(by, token);
-    if (!Object.prototype.hasOwnProperty.call(this.state.files, p)) throw new Error(`file not found: ${p}`);
+    if (!Object.prototype.hasOwnProperty.call(this.state.files, p)) throw fail(`file not found: ${p}`, 'NOT_FOUND');
     delete this.state.files[p];
     this._event('file.delete', by, `${by} deleted ${p}`);
     await this._save();
@@ -507,15 +617,16 @@ export class GhostBus {
 
   /** Full-text search across messages, tasks, and shared files. */
   async search(...args) { return this._serialized(() => this._search(...args)); }
-  async _search(query, { limit = 20 } = {}) {
+  async _search(query, { limit = 20, agent = null, token = null } = {}) {
     await this.init();
+    const viewer = this._viewerOf(agent, token);
     const q = String(query || '').toLowerCase().trim();
     if (q.length < 2) throw new Error('search query needs at least 2 characters');
     const hit = (text) => String(text || '').toLowerCase().includes(q);
     const lim = clampLimit(limit, 20, 500);
     return {
       query,
-      messages: clone(tailSlice(this.state.messages.filter(m => hit(m.body)), lim)),
+      messages: clone(tailSlice(this.state.messages.filter(m => this._canSee(m, viewer) && hit(m.body)), lim)),
       tasks: clone(tailSlice(this.state.tasks.filter(t => hit(t.title) || hit(t.body) || hit(t.result)), lim)),
       files: Object.entries(this.state.files).filter(([p, f]) => hit(p) || hit(f.text)).slice(0, lim)
         .map(([p, f]) => ({ path: p, updatedBy: f.updatedBy, updatedAt: f.updatedAt, excerpt: f.text.slice(0, 200) })),
@@ -538,7 +649,7 @@ export class GhostBus {
     await this.init();
     const pth = this._capsulePath(slug);
     if (!this.state.files[pth]) {
-      if (!create) throw new Error(`capsule not found: ${slug}`);
+      if (!create) throw fail(`capsule not found: ${slug}`, 'NOT_FOUND');
       if (by) this._requireAgent(by, token);
       this.state.files[pth] = { text: this._capsuleTemplate(slug, title), updatedBy: by || 'system', updatedAt: now(), history: [] };
       this._event('capsule.create', by || 'system', `capsule ${slug} created`);
@@ -612,8 +723,9 @@ export class GhostBus {
   /** Catch-up sync: every event after `sinceSeq`, plus the current head seq.
    *  An agent that was offline replays exactly what it missed — nothing more. */
   async sync(...args) { return this._serialized(() => this._sync(...args)); }
-  async _sync({ sinceSeq = 0, limit = 500 } = {}) {
+  async _sync({ sinceSeq = 0, limit = 500, agent = null, token = null } = {}) {
     await this.init();
+    const viewer = this._viewerOf(agent, token);
     // A garbage cursor (NaN from a non-numeric query param) used to match
     // NOTHING and report truncated:false — an offline agent would believe
     // itself caught up while missing everything (v0.5.5). It now means
@@ -621,13 +733,14 @@ export class GhostBus {
     const since = Number.isFinite(Number(sinceSeq)) ? Math.max(0, Math.floor(Number(sinceSeq))) : 0;
     const lim = clampLimit(limit, 500, 1000);
     const evs = this.state.events.filter(e => e.seq > since);
-    return { events: clone(evs.slice(0, lim)), headSeq: this.state.seq, truncated: evs.length > lim };
+    return { events: clone(evs.slice(0, lim)).map(e => this._redactEvent(e, viewer)), headSeq: this.state.seq, truncated: evs.length > lim };
   }
 
   async events(...args) { return this._serialized(() => this._events(...args)); }
-  async _events({ limit = 50 } = {}) {
+  async _events({ limit = 50, agent = null, token = null } = {}) {
     await this.init();
-    return clone(tailSlice(this.state.events, clampLimit(limit, 50, 500)));
+    const viewer = this._viewerOf(agent, token);
+    return clone(tailSlice(this.state.events, clampLimit(limit, 50, 500))).map(e => this._redactEvent(e, viewer));
   }
 
   async status(...args) { return this._serialized(() => this._status(...args)); }

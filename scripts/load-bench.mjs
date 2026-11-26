@@ -47,7 +47,7 @@ const rssMB = (pid) => {
   } catch { return null; }
 };
 
-export async function runBench({ agents: agentCount = 25, seconds = 30, port = 18561, quiet = false } = {}) {
+export async function runBench({ agents: agentCount = 25, seconds = 30, port = 18561, quiet = false, workers = 1 } = {}) {
   const log = (...a) => { if (!quiet) console.log(...a); };
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ghostbus-bench-'));
   const env = {
@@ -55,7 +55,9 @@ export async function runBench({ agents: agentCount = 25, seconds = 30, port = 1
     GHOSTBUS_ADMIN_KEY: ADMIN_KEY,
     GHOSTBUS_RATE_LIMIT_PER_MIN: '1000000', // see header: measures the bus, not the limiter
   };
-  const proc = spawn('node', ['src/hosted-server.mjs', '--port', String(port), '--data-dir', dataDir], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const serverArgs = ['src/hosted-server.mjs', '--port', String(port), '--data-dir', dataDir];
+  if (workers > 1) serverArgs.push('--workers', String(workers));
+  const proc = spawn('node', serverArgs, { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
   let serverStderr = '';
   proc.stderr.on('data', (d) => { serverStderr += d; });
   const base = `http://127.0.0.1:${port}`;
@@ -196,14 +198,16 @@ export async function runBench({ agents: agentCount = 25, seconds = 30, port = 1
       serverStderrTail: serverStderr.slice(-300),
     };
   } finally {
-    proc.kill('SIGKILL');
+    proc.kill('SIGTERM'); // lets a sharded router shut its workers down
+    await new Promise((r) => setTimeout(r, 300));
+    try { proc.kill('SIGKILL'); } catch {}
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const arg = (flag, def) => { const i = process.argv.indexOf(flag); return i >= 0 ? Number(process.argv[i + 1]) : def; };
-  const r = await runBench({ agents: arg('--agents', 25), seconds: arg('--seconds', 30), port: arg('--port', 18561) });
+  const r = await runBench({ agents: arg('--agents', 25), seconds: arg('--seconds', 30), port: arg('--port', 18561), workers: arg('--workers', 1) });
   console.log(`\nghostbus load bench — ${r.agents} agents, ${r.seconds.toFixed(1)}s window, one hosted workspace, tokens enforced`);
   console.log('(in-workspace rate limiter raised via GHOSTBUS_RATE_LIMIT_PER_MIN for the run — see header)');
   console.log(`\n${'op class'.padEnd(14)} ${'count'.padStart(7)} ${'errors'.padStart(7)} ${'p50 ms'.padStart(9)} ${'p95 ms'.padStart(9)}`);

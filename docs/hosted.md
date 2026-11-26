@@ -277,13 +277,40 @@ What the numbers mean:
 - **Correctness holds under concurrency.** Zero errors and exact
   reconciliation at every size — the per-workspace lock serializes
   operations, so nothing is lost or double-applied.
-- **The remaining ceiling is serialization + one CPU thread.** At ~300
-  ops/s on this VM, 25 and 50 agents land in the same place: operations
-  on one workspace queue behind its lock, and the process is single-
-  threaded. Latency at depth is queue wait, not work. More workspaces
-  spread load across buses, but a single hot workspace tops out at what
-  one core serves; multi-process sharding is the known next step and is
-  deliberately not faked (see `docs/security.md`, known limitations).
+- **The per-workspace ceiling is serialization + one CPU thread.** At
+  ~300 ops/s on this VM, 25 and 50 agents land in the same place:
+  operations on one workspace queue behind its lock, and one workspace
+  lives on one thread. Latency at depth is queue wait, not work. That
+  ceiling is per workspace, not per server: the same bench spread
+  across 4 workspaces (48 agents, 20 s) ran **~711 ops/s aggregate**
+  in a single process — independent buses interleave while one waits
+  on journal I/O.
+
+### Sharded mode (opt-in, `--workers N`)
+
+For multi-core hosts serving many workspaces, the hosted server can
+shard: `--workers N` (or `GHOSTBUS_WORKERS=N`, 2–16) turns the main
+process into a **router** that owns the registry and all
+authentication, and proxies each workspace to exactly one of N
+**worker** processes (stable hash of the workspace id, so the mapping
+survives restarts at the same N). Workers serve workspace traffic
+only, on random loopback ports, gated by a per-boot internal secret;
+a worker that dies is restarted and its workspaces reload from disk.
+The router starts listening only once every worker reports ready.
+Per-workspace semantics are unchanged — one worker still owns one
+workspace's journal store and lock.
+
+Measured on this 1.5-shared-CPU VM, honestly: a single workspace
+through the proxy ran ~280 ops/s (vs ~310 direct — the proxy hop
+costs ~10%), and the 4-workspace bench ran ~540 ops/s sharded vs
+~711 single-process. **On a 1–2 vCPU box, sharding does not buy
+throughput** — five processes contend for the same cores and the hop
+is pure tax. What it buys there is fault isolation (a worker crash
+costs in-flight requests on its workspaces, nothing else, and no
+data). The throughput case for sharding is a host with cores to
+spare — 4+ vCPUs serving many workspaces — where each worker gets
+its own core; that configuration cannot be measured from this
+sandbox and is not claimed. Default stays `--workers 1`.
 - **Memory plateaus.** Under sustained load the server's RSS climbed,
   then oscillated in a ~190–250 MB band. It did not grow linearly with
   the operation count; no leak was found.
@@ -313,14 +340,19 @@ Abuse limits an operator can tune (environment variables):
 | `GHOSTBUS_MAX_FILE_BYTES` | 1000000 | one shared file's size → `413` |
 | `GHOSTBUS_MAX_CONTEXT_BYTES` | 262144 | published context size → `413` |
 | `GHOSTBUS_JOURNAL_FSYNC` | off | `1` fsyncs every journal append (hosted store): survives OS/power loss, at one fsync per save. Off = survives a process kill, the same posture FileStore always had (v0.7.0) |
+| `GHOSTBUS_WORKERS` | 1 | `2`–`16` enables sharded mode (also `--workers N`): a router process owns the registry + auth and proxies each workspace to one worker process. For multi-core, multi-workspace hosts; see "Sharded mode" under Capacity & limits before enabling (v0.7.0) |
 
 When to scale out: one process serving a handful of team-sized workspaces
 is the design point — v0.7.0's journal store raised the per-workspace
 ceiling ~2.5× and removed the state-size tax, but operations on one
-workspace still serialize on one core. If a single workspace's sustained
-op rate becomes the bottleneck, the honest answer today is "more,
-smaller workspaces" — multi-process sharding and the networked
-multi-writer store are documented future work, not flags you can flip.
+workspace still serialize on one core. If many workspaces on a
+multi-core host become the bottleneck, `--workers N` shards them
+across worker processes (see "Sharded mode" above for the honest
+numbers). If a *single* workspace's sustained op rate is the
+bottleneck, the honest answer today is still "more, smaller
+workspaces" — the networked multi-writer store that would lift the
+per-workspace ceiling is documented future work, not a flag you can
+flip.
 
 ## Option B — serverless on Netlify (Blobs)
 

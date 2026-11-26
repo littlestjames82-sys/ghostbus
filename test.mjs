@@ -1694,6 +1694,113 @@ await check('JournalStore migrates a FileStore file in place and compacts on thr
   assert.equal(typeof head.base, 'number', 'journal restarts from a base header after compaction');
 });
 
+/* ---------------- v0.7.0: sharded hosted mode (router + workers) ---------------- */
+console.log('v0.7.0 sharded hosted mode:');
+await check('sharded mode: router auth, per-workspace proxying, tokens, rotation, SSE, export/import, delete', async () => {
+  const dataDir = path.join(tmp, 'shard-data');
+  const env = { ...process.env, GHOSTBUS_ADMIN_KEY: 'shard-admin-secret-0123' };
+  const cwd = new URL('.', import.meta.url).pathname;
+  const proc = spawn('node', ['src/hosted-server.mjs', '--port', '18416', '--data-dir', dataDir, '--workers', '2'], { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const B = 'http://127.0.0.1:18416';
+  const J = async (method, p, { key, token, body } = {}) => {
+    const r = await fetch(B + p, { method, headers: { ...(key ? { 'x-bus-key': key } : {}), ...(token ? { 'x-agent-token': token } : {}), 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+    let json = null; try { json = await r.json(); } catch {}
+    return { status: r.status, json };
+  };
+  try {
+    let health = null;
+    for (let i = 0; i < 60; i++) { try { health = await (await fetch(B + '/health')).json(); if (health.workers === 2) break; } catch {} await new Promise(r => setTimeout(r, 150)); }
+    assert.equal(health.mode, 'sharded'); assert.equal(health.workers, 2);
+    const keys = {};
+    for (const id of ['sh-alpha', 'sh-beta']) {
+      const c = await J('POST', '/api/workspaces', { key: env.GHOSTBUS_ADMIN_KEY, body: { id, name: id } });
+      assert.equal(c.status, 201, 'create ' + id); keys[id] = c.json.key;
+      const reg = await J('POST', `/w/${id}/api/agents`, { key: keys[id], body: { agent: 'w1' } });
+      assert.equal(reg.status, 200); assert.ok(reg.json.token);
+      const snd = await J('POST', `/w/${id}/api/messages`, { key: keys[id], token: reg.json.token, body: { agent: 'w1', to: '*', body: `hello ${id}` } });
+      assert.equal(snd.status, 200, 'send ' + id);
+      const st = await J('GET', `/w/${id}/api/status`, { key: keys[id] });
+      assert.equal(st.json.messages, 1);
+      keys[id + ':token'] = reg.json.token;
+    }
+    // auth lives at the router: no key / wrong key / missing agent token
+    assert.equal((await J('GET', '/w/sh-alpha/api/status', {})).status, 401);
+    assert.equal((await J('GET', '/w/sh-alpha/api/status', { key: 'f'.repeat(48) })).status, 401);
+    assert.equal((await J('POST', '/w/sh-alpha/api/messages', { key: keys['sh-alpha'], body: { agent: 'w1', to: '*', body: 'x' } })).status, 401, 'token enforcement through the proxy');
+    // rotation is immediate (the router checks keys, so no worker cache matters)
+    const rot = await J('POST', '/api/workspaces/sh-alpha/rotate-key', { key: env.GHOSTBUS_ADMIN_KEY, body: {} });
+    assert.equal(rot.status, 200);
+    assert.equal((await J('GET', '/w/sh-alpha/api/status', { key: keys['sh-alpha'] })).status, 401, 'old key must die at once');
+    assert.equal((await J('GET', '/w/sh-alpha/api/status', { key: rot.json.key })).status, 200);
+    keys['sh-alpha'] = rot.json.key;
+    // SSE streams through the proxy
+    const ac = new AbortController();
+    const sse = await fetch(`${B}/w/sh-beta/api/stream?agent=w1`, { headers: { 'x-bus-key': keys['sh-beta'], 'x-agent-token': keys['sh-beta:token'] }, signal: ac.signal });
+    assert.equal(sse.status, 200);
+    const reader = sse.body.getReader();
+    await J('POST', '/w/sh-beta/api/messages', { key: keys['sh-beta'], token: keys['sh-beta:token'], body: { agent: 'w1', to: '*', body: 'sse-marker' } });
+    let buf = '';
+    const deadline = Date.now() + 5000;
+    while (!buf.includes('sse-marker') && Date.now() < deadline) { const { value, done } = await reader.read(); if (done) break; buf += new TextDecoder().decode(value); }
+    ac.abort();
+    assert.ok(buf.includes('sse-marker'), 'SSE event must arrive through the router proxy');
+    // export -> import across workers, list fan-out, delete
+    const exp = await J('GET', '/api/workspaces/sh-beta/export', { key: env.GHOSTBUS_ADMIN_KEY });
+    assert.equal(exp.status, 200); assert.equal(exp.json.ghostbusExport, 1);
+    const imp = await J('POST', '/api/workspaces/import', { key: env.GHOSTBUS_ADMIN_KEY, body: { ...exp.json, id: 'sh-beta-copy' } });
+    assert.equal(imp.status, 201, 'import: ' + JSON.stringify(imp.json)); assert.equal(imp.json.messages, 2);
+    const list = await J('GET', '/api/workspaces', { key: env.GHOSTBUS_ADMIN_KEY });
+    assert.equal(list.json.workspaces.length, 3);
+    assert.ok(list.json.workspaces.every(w => !w.degraded), 'list fan-out must reach every owner');
+    const del = await J('DELETE', '/api/workspaces/sh-beta-copy', { key: env.GHOSTBUS_ADMIN_KEY });
+    assert.equal(del.status, 200);
+    assert.equal((await J('GET', '/w/sh-beta-copy/api/status', { key: imp.json.key })).status, 404);
+    assert.ok(!fs.existsSync(path.join(dataDir, 'sh-beta-copy.json')), 'deleted workspace file removed');
+  } finally {
+    proc.kill('SIGTERM'); // router shutdown kills its workers
+    await new Promise(r => setTimeout(r, 400));
+    try { proc.kill('SIGKILL'); } catch {}
+  }
+});
+
+await check('sharded mode: a killed worker is restarted and its workspaces reload from disk intact', async () => {
+  const dataDir = path.join(tmp, 'shard-kill-data');
+  const env = { ...process.env, GHOSTBUS_ADMIN_KEY: 'shard-admin-secret-0123' };
+  const cwd = new URL('.', import.meta.url).pathname;
+  const proc = spawn('node', ['src/hosted-server.mjs', '--port', '18417', '--data-dir', dataDir, '--workers', '2'], { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const B = 'http://127.0.0.1:18417';
+  const J = async (method, p, { key, token, body } = {}) => {
+    const r = await fetch(B + p, { method, headers: { ...(key ? { 'x-bus-key': key } : {}), ...(token ? { 'x-agent-token': token } : {}), 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+    let json = null; try { json = await r.json(); } catch {}
+    return { status: r.status, json };
+  };
+  try {
+    for (let i = 0; i < 60; i++) { try { const h = await (await fetch(B + '/health')).json(); if (h.workers === 2) break; } catch {} await new Promise(r => setTimeout(r, 150)); }
+    const c = await J('POST', '/api/workspaces', { key: env.GHOSTBUS_ADMIN_KEY, body: { id: 'sh-vault', name: 'Vault' } });
+    const reg = await J('POST', '/w/sh-vault/api/agents', { key: c.json.key, body: { agent: 'keeper' } });
+    await J('POST', '/w/sh-vault/api/messages', { key: c.json.key, token: reg.json.token, body: { agent: 'keeper', to: '*', body: 'must survive' } });
+    const { execSync } = await import('node:child_process');
+    const kids = execSync(`pgrep -P ${proc.pid}`).toString().trim().split('\n').filter(Boolean);
+    assert.equal(kids.length, 2, 'router must have exactly 2 worker children');
+    process.kill(Number(kids[0]), 'SIGKILL');
+    // first wait for the router to NOTICE the death (health drops to 1) —
+    // polling straight for "back to 2" can read the stale pre-exit state.
+    let noticed = false;
+    for (let i = 0; i < 50; i++) { try { const h = await (await fetch(B + '/health')).json(); if (h.workers === 1) { noticed = true; break; } } catch {} await new Promise(r => setTimeout(r, 100)); }
+    assert.ok(noticed, 'router must notice the worker death');
+    let back = null;
+    for (let i = 0; i < 60; i++) { try { const h = await (await fetch(B + '/health')).json(); if (h.workers === 2) { back = h; break; } } catch {} await new Promise(r => setTimeout(r, 200)); }
+    assert.ok(back, 'worker must be restarted by the router');
+    const st = await J('GET', '/w/sh-vault/api/status', { key: c.json.key });
+    assert.equal(st.status, 200);
+    assert.equal(st.json.messages, 1, 'workspace state must survive a worker crash');
+  } finally {
+    proc.kill('SIGTERM');
+    await new Promise(r => setTimeout(r, 400));
+    try { proc.kill('SIGKILL'); } catch {}
+  }
+});
+
 /* ---------------- supply chain ---------------- */
 console.log('supply chain:');
 await check('pack manifest matches the allowlist (v0.5.8)', async () => {

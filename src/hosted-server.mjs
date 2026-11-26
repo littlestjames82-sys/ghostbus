@@ -41,12 +41,18 @@
  *   time, so key rotation and deletion take effect in the serving
  *   process immediately. The hosted process owns its data directory:
  *   workspace files edited behind its back are not picked up until
- *   restart.
+ *   restart. Optional sharded mode (--workers N): a router process owns
+ *   the registry and all auth and proxies each workspace to one of N
+ *   worker processes (stable id hash), spreading workspaces across
+ *   cores; workers are gated by a per-boot internal secret and a dead
+ *   worker is restarted with its workspaces reloaded from disk.
  */
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { fork } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { createBus, JournalStore, GHOSTBUS_VERSION, validateSnapshot } from './core.mjs';
 import { createBusHandler, clientIp, keyMatches, hashMatches, readJsonBody, MAX_BODY_BYTES, HTML_SECURITY_HEADERS, applyServerTimeouts, SERVER_TIMEOUT_DEFAULTS } from './handler.mjs';
 
@@ -60,6 +66,25 @@ const ADMIN_KEY = process.env.GHOSTBUS_ADMIN_KEY || '';
 // means on) — the hosted server is the one deployment that serves people
 // other than the operator, so the safe posture cannot be opt-in.
 const REQUIRE_TOKENS = process.env.GHOSTBUS_REQUIRE_TOKENS !== '0';
+// Sharded mode (v0.7.0): with --workers N (or GHOSTBUS_WORKERS=N, N > 1)
+// this process becomes a ROUTER — it owns the registry, authenticates
+// every request, and proxies each workspace to exactly one worker
+// process (chosen by a stable hash of the workspace id, so the mapping
+// survives restarts at the same N). Workers are this same file re-run
+// with GHOSTBUS_WORKER=1: they serve workspace traffic only, gated by a
+// per-boot internal secret the router injects into every proxied
+// request, and never see workspace keys (the router already checked
+// them). One worker still owns one workspace's JournalStore, so the
+// per-workspace serialization semantics are unchanged — sharding only
+// spreads workspaces across cores.
+const WORKER_MODE = process.env.GHOSTBUS_WORKER === '1';
+const INTERNAL_SECRET = process.env.GHOSTBUS_INTERNAL_SECRET || '';
+const WORKERS = Math.min(16, Math.max(1, Math.floor(Number(argVal('--workers') || process.env.GHOSTBUS_WORKERS || 1)) || 1));
+const ROUTER_MODE = WORKERS > 1 && !WORKER_MODE;
+if (WORKER_MODE && !INTERNAL_SECRET) {
+  process.stderr.write('GHOSTBUS_WORKER=1 requires GHOSTBUS_INTERNAL_SECRET (workers serve only router-proxied traffic).\n');
+  process.exit(2);
+}
 
 if (!ADMIN_KEY) {
   process.stderr.write('GHOSTBUS_ADMIN_KEY is required for the hosted server (workspace creation must not be open).\n');
@@ -211,8 +236,53 @@ const server = http.createServer(async (req, res) => {
   };
 
   try {
+    // Worker gate (sharded mode): a worker serves NOTHING without the
+    // router's per-boot internal secret — its port is loopback-only and
+    // unauthenticated direct traffic is refused outright.
+    if (WORKER_MODE && !keyMatches(String(req.headers['x-gb-internal'] || ''), INTERNAL_SECRET)) {
+      return send(401, { error: 'internal only' });
+    }
     if (req.method === 'GET' && url.pathname === '/') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', ...HTML_SECURITY_HEADERS }); return res.end(LANDING); }
     if (req.method === 'GET' && url.pathname === '/health') return send(200, { ok: true, server: 'ghostbus-hosted', version: GHOSTBUS_VERSION, workspaces: Object.keys(loadRegistry().workspaces).length });
+
+    // ---- internal routes (worker mode only): the router drives these
+    // for the admin operations that need the owning worker's live bus.
+    if (WORKER_MODE && url.pathname.startsWith('/__internal/')) {
+      if (req.method === 'GET' && url.pathname === '/__internal/health') return send(200, { ok: true, worker: true });
+      const im = url.pathname.match(/^\/__internal\/workspaces\/([a-z0-9-]+)\/(export|import|drop)$/);
+      const rm = url.pathname.match(/^\/__internal\/workspaces\/([a-z0-9-]+)\/reset-token\/([^/]+)$/);
+      if (im) {
+        const [, iid, op] = im;
+        const w = await getWorkspace(iid);
+        if (!w) return send(404, { error: `no such workspace: ${iid}` });
+        if (op === 'export' && req.method === 'GET') return send(200, await w.bus.snapshot());
+        if (op === 'import' && req.method === 'POST') {
+          const body = await readBody();
+          if (body === TOO_LARGE) return;
+          if (!body || !body.state) return send(400, { error: 'state required' });
+          try {
+            const st = await w.bus.restore(body.state, { by: 'operator' });
+            return send(200, { agents: st.agents, messages: st.messages, tasks: st.tasks.total });
+          } catch (e) { return send(400, { error: (e && e.message) || 'invalid snapshot' }); }
+        }
+        if (op === 'drop' && req.method === 'POST') { buses.delete(iid); handlers.delete(iid); return send(200, { ok: true }); }
+        return send(405, { error: 'method not allowed' });
+      }
+      if (rm && req.method === 'POST') {
+        const [, iid, agentName] = rm;
+        const w = await getWorkspace(iid);
+        if (!w) return send(404, { error: `no such workspace: ${iid}` });
+        try {
+          const r = await w.bus.operatorResetAgentToken({ name: decodeURIComponent(agentName) });
+          return send(200, r);
+        } catch (e) {
+          return send(e && e.code === 'UNKNOWN_AGENT' ? 404 : 400, { error: (e && e.message) || 'reset failed', code: (e && e.code) || undefined });
+        }
+      }
+      return send(404, { error: 'not found' });
+    }
+    // Workers expose no public admin surface; the router owns it.
+    if (WORKER_MODE && url.pathname.startsWith('/api/workspaces')) return send(404, { error: 'not found' });
 
     // ---- admin ----
     // Failed-auth throttle (v0.5.3): sustained key guessing gets 429s on the
@@ -340,8 +410,10 @@ const server = http.createServer(async (req, res) => {
       sub.pathname = wMatch[2] || '/';
       // Open surfaces mirror the single relay: board page, health, probe.
       const open = sub.pathname === '/' || sub.pathname === '/health' || sub.pathname === '/probe';
-      if (!open && authThrottled(ip)) return send(429, { error: 'too many failed auth attempts — try again shortly' });
-      if (!open && !wsKeyOk(req, w.meta)) { noteAuthFail(ip); return send(401, { error: 'missing or wrong workspace key' }); }
+      // In worker mode the router already authenticated and throttled;
+      // the worker trusts the internal gate above.
+      if (!open && !WORKER_MODE && authThrottled(ip)) return send(429, { error: 'too many failed auth attempts — try again shortly' });
+      if (!open && !WORKER_MODE && !wsKeyOk(req, w.meta)) { noteAuthFail(ip); return send(401, { error: 'missing or wrong workspace key' }); }
       return handlerFor(id, w.bus)(req, res, sub);
     }
 
@@ -352,6 +424,258 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------
+// Sharded mode (v0.7.0): the router process. It owns the registry and
+// ALL authentication (admin key, workspace keys, failed-auth throttle),
+// then streams each workspace's traffic to the one worker process that
+// owns it (stable hash of the id). Workers are this same file with
+// GHOSTBUS_WORKER=1, listening on random loopback ports, gated by a
+// per-boot internal secret. A dead worker is restarted; its workspaces
+// reload from their on-disk snapshot+journal, so a worker crash costs
+// in-flight requests, never data.
+// ---------------------------------------------------------------------
+function startRouter() {
+  const secret = crypto.randomBytes(24).toString('hex');
+  const selfPath = fileURLToPath(import.meta.url);
+  const workers = [];
+  let shuttingDown = false;
+  const ownerOf = (id) => crypto.createHash('sha256').update(id).digest().readUInt32BE(0) % WORKERS;
+
+  function forkWorker(i) {
+    const child = fork(selfPath, ['--data-dir', dataDir], {
+      env: {
+        ...process.env,
+        GHOSTBUS_WORKER: '1',
+        GHOSTBUS_INTERNAL_SECRET: secret,
+        GHOSTBUS_PORT: '0',
+        GHOSTBUS_TRUSTED_PROXIES: [process.env.GHOSTBUS_TRUSTED_PROXIES, 'loopback'].filter(Boolean).join(','),
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    const w = { child, port: 0, ready: false };
+    workers[i] = w;
+    child.stdout.on('data', (d) => process.stdout.write(d));
+    child.stderr.on('data', (d) => process.stderr.write(d));
+    child.on('message', (m) => { if (m && m.type === 'ready' && Number(m.port) > 0) { w.port = m.port; w.ready = true; maybeListen(); } });
+    child.on('error', () => {});
+    child.on('exit', (code, signal) => {
+      w.ready = false; w.port = 0;
+      if (!shuttingDown) {
+        process.stderr.write(`ghostbus router: worker ${i} exited (${signal || ('code ' + code)}); restarting in 1s — its workspaces reload from disk\n`);
+        setTimeout(() => { if (!shuttingDown) forkWorker(i); }, 1000);
+      }
+    });
+  }
+  for (let i = 0; i < WORKERS; i++) forkWorker(i);
+
+  const internalCall = async (idx, method, p, body) => {
+    const w = workers[idx];
+    if (!w || !w.ready) return { status: 502, json: { error: 'workspace worker unavailable' } };
+    try {
+      const r = await fetch(`http://127.0.0.1:${w.port}${p}`, {
+        method,
+        headers: { 'x-gb-internal': secret, ...(body !== undefined ? { 'content-type': 'application/json' } : {}) },
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+      });
+      let json = null; try { json = await r.json(); } catch {}
+      return { status: r.status, json };
+    } catch { return { status: 502, json: { error: 'workspace worker unavailable' } }; }
+  };
+
+  const proxyTo = (req, res, idx, ip) => {
+    const w = workers[idx];
+    const headers = { ...req.headers, host: `127.0.0.1:${w.port}`, 'x-gb-internal': secret, 'x-forwarded-for': ip };
+    const up = http.request({ host: '127.0.0.1', port: w.port, method: req.method, path: req.url, headers }, (upRes) => {
+      res.writeHead(upRes.statusCode || 502, upRes.headers);
+      upRes.pipe(res);
+    });
+    up.on('error', () => {
+      if (!res.headersSent) res.writeHead(502, { 'content-type': 'application/json' });
+      if (!res.writableEnded) res.end(JSON.stringify({ error: 'workspace worker unavailable' }));
+    });
+    res.on('close', () => { try { up.destroy(); } catch {} });
+    req.pipe(up);
+  };
+
+  const TOO_LARGE_R = { tooLarge: true };
+  const router = http.createServer(async (req, res) => {
+    const send = (status, obj, type = 'application/json') => {
+      if (res.headersSent) return;
+      const b = type === 'application/json' ? JSON.stringify(obj) : String(obj);
+      res.writeHead(status, { 'content-type': type }); res.end(b);
+    };
+    res.setHeader('x-content-type-options', 'nosniff');
+    res.setHeader('referrer-policy', 'no-referrer');
+    const ip = clientIp(req);
+    const adminDenied = () => { noteAuthFail(ip); return send(401, { error: 'admin key required' }); };
+    const readBody = async () => {
+      try { return await readJsonBody(req); }
+      catch (e) {
+        if (e && e.code === 'BODY_TOO_LARGE') { send(413, { error: `request body too large (limit ${MAX_BODY_BYTES} bytes)` }); return TOO_LARGE_R; }
+        throw e;
+      }
+    };
+    try {
+      const url = new URL(req.url, 'http://localhost');
+      if (req.method === 'GET' && url.pathname === '/') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', ...HTML_SECURITY_HEADERS }); return res.end(LANDING); }
+      if (req.method === 'GET' && url.pathname === '/health') return send(200, { ok: true, server: 'ghostbus-hosted', version: GHOSTBUS_VERSION, mode: 'sharded', workers: workers.filter((w) => w && w.ready).length, workspaces: Object.keys(loadRegistry().workspaces).length });
+
+      if (url.pathname.startsWith('/api/workspaces') && authThrottled(ip)) return send(429, { error: 'too many failed auth attempts — try again shortly' });
+
+      if (url.pathname === '/api/workspaces' && req.method === 'POST') {
+        if (!isAdmin(req)) return adminDenied();
+        const body = await readBody();
+        if (body === TOO_LARGE_R) return;
+        if (!body) return send(400, { error: 'invalid JSON body' });
+        const reg = loadRegistry();
+        const id = body.id || `ws-${crypto.randomBytes(4).toString('hex')}`;
+        if (!validId(id)) return send(400, { error: 'workspace id: lowercase letters, digits, - (2-63 chars)' });
+        if (reg.workspaces[id]) return send(409, { error: `workspace already exists: ${id}` });
+        const key = crypto.randomBytes(24).toString('hex');
+        reg.workspaces[id] = { name: String(body.name || id).slice(0, 120), keyHash: sha256(key), createdAt: new Date().toISOString() };
+        saveRegistry(reg);
+        audit('create', id, req);
+        return send(201, { id, name: reg.workspaces[id].name, key, keyNote: 'Workspace key — shown ONCE, only its hash is stored. Agents use it as x-bus-key (or Bearer) under /w/' + id + '/.', board: `/w/${id}/` });
+      }
+      if (url.pathname === '/api/workspaces' && req.method === 'GET') {
+        if (!isAdmin(req)) return adminDenied();
+        const reg = loadRegistry();
+        const out = [];
+        for (const [id, meta] of Object.entries(reg.workspaces)) {
+          const st = await internalCall(ownerOf(id), 'GET', `/w/${id}/api/status`);
+          if (st.status === 200 && st.json && st.json.tasks) out.push({ id, name: meta.name, createdAt: meta.createdAt, agents: st.json.agents, queued: st.json.tasks.queued, needsApproval: st.json.tasks.needsApproval, messages: st.json.messages });
+          else out.push({ id, name: meta.name, createdAt: meta.createdAt, agents: 0, queued: 0, needsApproval: 0, messages: 0, degraded: true });
+        }
+        return send(200, { workspaces: out });
+      }
+      const rotateMatch = url.pathname.match(/^\/api\/workspaces\/([a-z0-9-]+)\/rotate-key$/);
+      if (req.method === 'POST' && rotateMatch) {
+        if (!isAdmin(req)) return adminDenied();
+        const reg = loadRegistry();
+        const id = rotateMatch[1];
+        if (!reg.workspaces[id]) return send(404, { error: `no such workspace: ${id}` });
+        const key = crypto.randomBytes(24).toString('hex');
+        reg.workspaces[id].keyHash = sha256(key);
+        reg.workspaces[id].keyRotatedAt = new Date().toISOString();
+        saveRegistry(reg);
+        audit('rotate-key', id, req);
+        return send(200, { id, key, keyNote: 'New workspace key — shown ONCE. The previous key is invalid from this moment.', keyRotatedAt: reg.workspaces[id].keyRotatedAt });
+      }
+      const resetTokMatch = url.pathname.match(/^\/api\/workspaces\/([a-z0-9-]+)\/agents\/([A-Za-z0-9][A-Za-z0-9._-]{0,63})\/reset-token$/);
+      if (req.method === 'POST' && resetTokMatch) {
+        if (!isAdmin(req)) return adminDenied();
+        const [, id, agentName] = resetTokMatch;
+        if (!loadRegistry().workspaces[id]) return send(404, { error: `no such workspace: ${id}` });
+        const r = await internalCall(ownerOf(id), 'POST', `/__internal/workspaces/${id}/reset-token/${encodeURIComponent(agentName)}`, {});
+        if (r.status === 200) audit('reset-agent-token', id, req);
+        return send(r.status, r.json || { error: 'workspace worker unavailable' });
+      }
+      const exportMatch = url.pathname.match(/^\/api\/workspaces\/([a-z0-9-]+)\/export$/);
+      if (req.method === 'GET' && exportMatch) {
+        if (!isAdmin(req)) return adminDenied();
+        const id = exportMatch[1];
+        const meta = loadRegistry().workspaces[id];
+        if (!meta) return send(404, { error: `no such workspace: ${id}` });
+        const r = await internalCall(ownerOf(id), 'GET', `/__internal/workspaces/${id}/export`);
+        if (r.status !== 200 || !r.json) return send(r.status === 200 ? 502 : r.status, r.json || { error: 'workspace worker unavailable' });
+        audit('export', id, req);
+        return send(200, { ghostbusExport: 1, version: GHOSTBUS_VERSION, exportedAt: new Date().toISOString(), workspace: { id, name: meta.name }, state: r.json });
+      }
+      if (url.pathname === '/api/workspaces/import' && req.method === 'POST') {
+        if (!isAdmin(req)) return adminDenied();
+        const body = await readBody();
+        if (body === TOO_LARGE_R) return;
+        if (!body) return send(400, { error: 'invalid JSON body' });
+        const env = body.ghostbusExport ? body : null;
+        const state = env ? env.state : (body.state || body);
+        const bad = validateSnapshot(state);
+        if (bad) return send(400, { error: `invalid snapshot: ${bad}` });
+        const reg = loadRegistry();
+        const id = body.id || (env && env.workspace && env.workspace.id) || state.workspace.id || `ws-${crypto.randomBytes(4).toString('hex')}`;
+        if (!validId(id)) return send(400, { error: 'workspace id: lowercase letters, digits, - (2-63 chars)' });
+        if (reg.workspaces[id]) return send(409, { error: `workspace already exists: ${id} (delete it first, or import under a new id)` });
+        const name = String(body.name || (env && env.workspace && env.workspace.name) || state.workspace.name || id).slice(0, 120);
+        const key = crypto.randomBytes(24).toString('hex');
+        reg.workspaces[id] = { name, keyHash: sha256(key), createdAt: new Date().toISOString(), importedAt: new Date().toISOString() };
+        saveRegistry(reg);
+        const r = await internalCall(ownerOf(id), 'POST', `/__internal/workspaces/${id}/import`, { state });
+        if (r.status !== 200 || !r.json) {
+          const reg2 = loadRegistry();
+          delete reg2.workspaces[id];
+          saveRegistry(reg2);
+          return send(r.status === 200 ? 502 : r.status, (r.json && r.json.error) ? r.json : { error: 'import failed in the owning worker; registry entry rolled back' });
+        }
+        audit('import', id, req);
+        return send(201, { id, name, key, keyNote: 'Workspace key — shown ONCE, only its hash is stored. Imported workspaces always get a FRESH key; the source key is not carried over.', agents: r.json.agents, messages: r.json.messages, tasks: r.json.tasks, board: `/w/${id}/` });
+      }
+      const delMatch = url.pathname.match(/^\/api\/workspaces\/([a-z0-9-]+)$/);
+      if (req.method === 'DELETE' && delMatch) {
+        if (!isAdmin(req)) return adminDenied();
+        const reg = loadRegistry();
+        const id = delMatch[1];
+        if (!reg.workspaces[id]) return send(404, { error: `no such workspace: ${id}` });
+        await internalCall(ownerOf(id), 'POST', `/__internal/workspaces/${id}/drop`, {}); // best effort: release the owner's in-memory bus
+        delete reg.workspaces[id];
+        saveRegistry(reg);
+        try { fs.unlinkSync(path.join(dataDir, `${id}.json`)); } catch {}
+        try { fs.unlinkSync(path.join(dataDir, `${id}.json.journal`)); } catch {}
+        audit('delete', id, req);
+        return send(200, { id, deleted: true });
+      }
+
+      const wMatch = url.pathname.match(/^\/w\/([a-z0-9-]+)(\/.*)?$/);
+      if (wMatch) {
+        const id = wMatch[1];
+        const meta = loadRegistry().workspaces[id];
+        if (!meta) return send(404, { error: `no such workspace: ${id}` });
+        const sub = wMatch[2] || '/';
+        const open = sub === '/' || sub === '/health' || sub === '/probe';
+        if (!open && authThrottled(ip)) return send(429, { error: 'too many failed auth attempts — try again shortly' });
+        if (!open && !wsKeyOk(req, meta)) { noteAuthFail(ip); return send(401, { error: 'missing or wrong workspace key' }); }
+        const idx = ownerOf(id);
+        const w = workers[idx];
+        if (!w || !w.ready) return send(502, { error: 'workspace worker unavailable' });
+        return proxyTo(req, res, idx, ip);
+      }
+
+      return send(404, { error: 'not found' });
+    } catch (e) {
+      process.stderr.write(`ghostbus router: internal error: ${(e && e.stack) || e}\n`);
+      return send(500, { error: 'internal error' });
+    }
+  });
+  applyServerTimeouts(router, {
+    headersMs: timeoutOpt('GHOSTBUS_HEADERS_TIMEOUT_MS', SERVER_TIMEOUT_DEFAULTS.headersMs),
+    requestMs: timeoutOpt('GHOSTBUS_REQUEST_TIMEOUT_MS', SERVER_TIMEOUT_DEFAULTS.requestMs),
+  });
+  // Readiness gate: the router starts listening only once every worker
+  // has reported ready (or after 5s, so one crash-looping worker cannot
+  // block the workspaces owned by healthy ones — those 502 until it is
+  // back). Without this, clients that connect the moment the port opens
+  // race worker startup and eat avoidable 502s.
+  let listening = false;
+  function maybeListen() {
+    if (listening) return;
+    if (workers.filter((w) => w && w.ready).length < WORKERS) return;
+    listening = true;
+    router.listen(port, () => {
+      process.stderr.write(`ghostbus HOSTED v${GHOSTBUS_VERSION} · http://127.0.0.1:${port} · data=${dataDir} · mode=sharded workers=${WORKERS} · agentTokens=${REQUIRE_TOKENS ? 'enforced' : 'issued, not enforced'}\n`);
+    });
+  }
+  setTimeout(() => {
+    if (!listening) {
+      listening = true;
+      process.stderr.write('ghostbus router: not all workers ready after 5s; listening anyway (unready owners 502 until back)\n');
+      router.listen(port, () => {
+        process.stderr.write(`ghostbus HOSTED v${GHOSTBUS_VERSION} · http://127.0.0.1:${port} · data=${dataDir} · mode=sharded workers=${WORKERS} · agentTokens=${REQUIRE_TOKENS ? 'enforced' : 'issued, not enforced'}\n`);
+      });
+    }
+  }, 5000).unref?.();
+  const shutdown = () => { shuttingDown = true; for (const w of workers) { try { if (w) w.child.kill('SIGTERM'); } catch {} } };
+  process.on('SIGTERM', () => { shutdown(); process.exit(0); });
+  process.on('SIGINT', () => { shutdown(); process.exit(0); });
+}
+
 // Explicit server timeouts (v0.5.6): slow-loris header/body deadlines, set
 // here rather than inherited from Node defaults — see applyServerTimeouts
 // in handler.mjs for the scoping (long-lived streams are never bounded).
@@ -361,6 +685,11 @@ applyServerTimeouts(server, {
   requestMs: timeoutOpt('GHOSTBUS_REQUEST_TIMEOUT_MS', SERVER_TIMEOUT_DEFAULTS.requestMs),
 });
 
-server.listen(port, () => {
-  process.stderr.write(`ghostbus HOSTED v${GHOSTBUS_VERSION} · http://127.0.0.1:${port} · data=${dataDir} · workspaces=${Object.keys(loadRegistry().workspaces).length} · agentTokens=${REQUIRE_TOKENS ? 'enforced' : 'issued, not enforced'}\n`);
-});
+if (ROUTER_MODE) {
+  startRouter();
+} else {
+  server.listen(port, () => {
+    process.stderr.write(`ghostbus HOSTED v${GHOSTBUS_VERSION} · http://127.0.0.1:${port} · data=${dataDir} · workspaces=${Object.keys(loadRegistry().workspaces).length} · agentTokens=${REQUIRE_TOKENS ? 'enforced' : 'issued, not enforced'}${WORKER_MODE ? ' · worker' : ''}\n`);
+    if (WORKER_MODE && process.send) { try { process.send({ type: 'ready', port: server.address().port }); } catch {} }
+  });
+}

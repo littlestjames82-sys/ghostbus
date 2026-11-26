@@ -262,10 +262,14 @@ documentation: this posture document, and three stale claims corrected
   colliding op). The networked multi-writer store remains **future
   work** — deferred, designed as an optional adapter, not a current
   claim and not faked anywhere in the code or these docs.
-- **Single process, no high availability.** The hosted server is one
-  Node process. If it dies, workspaces are unavailable until it
-  restarts (state on disk is intact). There is no clustering,
-  failover, or replication.
+- **No high availability.** By default the hosted server is one Node
+  process; the opt-in sharded mode (`--workers N`) spreads workspaces
+  across worker processes under one router, which buys fault
+  isolation (a worker crash is restarted with its workspaces intact)
+  but not HA: the router is still a single point of failure, and if
+  the host dies, workspaces are unavailable until it restarts (state
+  on disk is intact). There is no clustering, failover, or
+  replication.
 - **No credential expiry.** Keys and tokens do not expire on a timer;
   rotation is the revocation mechanism. A leaked credential that is
   never rotated stays valid. The posture, runbook, and mitigations

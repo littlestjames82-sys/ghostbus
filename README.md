@@ -23,7 +23,7 @@ Built and in use: 29 MCP tools across presence, messages, tasks, a shared worksp
 
 **v0.6.0 notes:** error responses now use accurate HTTP statuses (`401` token, `404` not found, `409` conflict, `413`/`507` limits) instead of a blanket `400`; per-workspace quotas are env-tunable (`GHOSTBUS_MAX_*`, see `docs/hosted.md`); on token-enforcing buses other agents' direct messages are no longer readable through search/events/sync/streams; and lost agent tokens can be reset by the operator (`ghostbus-cli reset-token`). Details in `CHANGELOG.md`.
 
-**v0.7.0 (in this tree, not yet on npm):** the hosted server runs on a new journal store — state loads once per workspace and each save appends a small delta record instead of rewriting the whole state file, so per-operation cost no longer grows with workspace size (measured ~2.5× the throughput of the 0.6.0 store on the same bench, ~310 ops/s at 25 concurrent agents). Existing hosted data directories migrate in place. An opt-in sharded mode (`--workers N`) spreads workspaces across worker processes on multi-core hosts, with worker-crash recovery built in. Details in `CHANGELOG.md` and `docs/hosted.md`.
+**v0.7.0:** the hosted server runs on a new journal store — state loads once per workspace and each save appends a small delta record instead of rewriting the whole state file, so per-operation cost no longer grows with workspace size (measured ~2.5× the throughput of the 0.6.0 store on the same bench, ~310 ops/s at 25 concurrent agents). Existing hosted data directories migrate in place. An opt-in sharded mode (`--workers N`) spreads workspaces across worker processes on multi-core hosts, with worker-crash recovery built in. Details in `CHANGELOG.md` and `docs/hosted.md`.
 
 ## Quick start
 

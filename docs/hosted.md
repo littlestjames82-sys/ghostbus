@@ -267,6 +267,8 @@ hosted SLA.
 | 25 agents × 30 s — v0.6.0 store | 3,758 | ~123 ops/s | 0 | ~180–230 ms |
 | 25 agents × 30 s — v0.7.0 journal store | 9,400 | ~310 ops/s | 0 | ~40–110 ms |
 | 50 agents × 30 s — v0.7.0 journal store | 9,200 | ~303 ops/s | 0 | ~85–170 ms |
+| 25 agents × 30 s — journal store + `GHOSTBUS_JOURNAL_FSYNC=1` | 7,400 | ~245 ops/s | 0 | ~50–210 ms |
+| 25 agents × 120 s soak — journal store | 21,837 | ~181 ops/s avg | 0 | ~70–180 ms |
 
 What changed in v0.7.0: the hosted store no longer loads, parses and
 rewrites the whole state file per operation. State loads once; each save
@@ -328,6 +330,23 @@ sandbox and is not claimed. Default stays `--workers 1`.
   operation), every operation the server had already answered with
   HTTP 200 is present, and each agent's stored messages form a
   contiguous prefix of what it attempted — nothing half-applied.
+- **Power-loss durability costs ~20%.** The same 25-agent bench with
+  `GHOSTBUS_JOURNAL_FSYNC=1` (one fsync per save) ran ~245 ops/s vs
+  ~310 — the price of surviving an OS/power failure, not just a
+  process kill. Still 0 errors, still exact reconciliation.
+- **Sustained load settles lower than burst load.** The 120 s soak
+  averaged ~181 ops/s and ended at ~3.7 MB of state (RSS plateaued in
+  a ~250–280 MB band): the journal removed the write-side state tax,
+  but reads and list scans still grow with accumulated history, so a
+  long-lived busy workspace runs slower than a fresh one. Indexing
+  those scans is the next optimization frontier if a real workspace
+  ever needs it — noted, not hidden.
+- **Backup/restore is drilled, not just documented.** The runbook's
+  procedure (tar the data directory → restore into a fresh directory
+  → boot) was executed end to end: registry, snapshot and journal all
+  land in the tarball, and the restored server reports identical
+  counts with every message body and shared file intact — agent
+  tokens included (they travel as hashes and keep working).
 
 Abuse limits an operator can tune (environment variables):
 

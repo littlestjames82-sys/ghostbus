@@ -1801,6 +1801,99 @@ await check('sharded mode: a killed worker is restarted and its workspaces reloa
   }
 });
 
+/* ---------------- v0.7.0: read indexes (id maps, sliced sync, early-exit inbox) ---------------- */
+console.log('v0.7.0 read indexes:');
+await check('indexed reads match brute-force scans across a randomized op mix', async () => {
+  // Deterministic PRNG so the mix is identical on every run.
+  let seed = 123456789;
+  const rnd = () => { seed |= 0; seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  const pick = (arr) => arr[Math.floor(rnd() * arr.length)];
+  const bus = await createBus(new MemoryStore(), { name: 'Indexed' });
+  const agents = ['ix-a', 'ix-b', 'ix-c', 'ix-d', 'ix-e', 'ix-f'];
+  for (const a of agents) await bus.registerAgent({ name: a });
+  const taskIds = [];
+  let rootId = null;
+  for (let i = 0; i < 600; i++) {
+    const a = pick(agents);
+    const r = rnd();
+    if (r < 0.55) {
+      const m = await bus.sendMessage({ from: a, to: rnd() < 0.5 ? '*' : pick(agents), body: `ix msg ${i}`, ...(rootId && rnd() < 0.3 ? { threadId: rootId } : {}) });
+      if (!rootId) rootId = m.id;
+    } else if (r < 0.7) {
+      const t = await bus.createTask({ from: a, title: `ix task ${i}` });
+      taskIds.push(t.id);
+    } else if (r < 0.85 && taskIds.length) {
+      const id = pick(taskIds);
+      try { await bus.claimTask(id, { by: pick(agents) }); await bus.completeTask(id, { by: pick(agents), result: 'ix done' }); } catch { /* already claimed/done — fine */ }
+    } else {
+      await bus.heartbeat({ name: a });
+    }
+  }
+  const bruteInbox = (name, unread) => {
+    let ms = bus.state.messages.filter(m => m.to === name || m.to === '*' || m.from === name);
+    if (unread) ms = ms.filter(m => !m.readBy.includes(name));
+    return ms.slice(-50).map(m => m.id);
+  };
+  for (const a of agents) {
+    const got = (await bus.inbox(a, { markRead: false, limit: 50 })).map(m => m.id);
+    assert.deepEqual(got, bruteInbox(a, false), `inbox mismatch for ${a}`);
+    const gotU = (await bus.inbox(a, { markRead: false, unreadOnly: true, limit: 50 })).map(m => m.id);
+    assert.deepEqual(gotU, bruteInbox(a, true), `unread inbox mismatch for ${a}`);
+  }
+  for (const since of [0, 1, 137, bus.state.seq - 3, bus.state.seq]) {
+    const s = await bus.sync({ sinceSeq: since, limit: 1000 });
+    const brute = bus.state.events.filter(e => e.seq > since).slice(0, 1000).map(e => e.seq);
+    assert.deepEqual(s.events.map(e => e.seq), brute, `sync mismatch since ${since}`);
+    assert.equal(s.truncated, bus.state.events.filter(e => e.seq > since).length > 1000);
+  }
+  if (rootId) {
+    const th = await bus.thread(rootId);
+    const bruteTh = bus.state.messages.filter(m => m.id === rootId || m.threadId === rootId).map(m => m.id);
+    assert.deepEqual(th.map(m => m.id), bruteTh, 'thread mismatch');
+  }
+  // task lookups through the map act on exactly the object the array
+  // holds: a comment added by id must be visible in the array's object
+  const listed = await bus.listTasks();
+  assert.equal(listed.length, bus.state.tasks.length, 'listTasks must cover the whole array');
+  for (const id of taskIds.slice(0, 25)) {
+    const viaScan = bus.state.tasks.find(t => t.id === id);
+    const before = viaScan.comments.length;
+    const acted = await bus.addTaskComment(id, { by: 'ix-a', body: 'index probe' });
+    assert.equal(acted.id, id);
+    assert.equal(viaScan.comments.length, before + 1, `comment must land on the array object for task ${id}`);
+    assert.equal(viaScan.comments[viaScan.comments.length - 1].body, 'index probe');
+  }
+  await assert.rejects(() => bus.addTaskComment(999999, { by: 'ix-a', body: 'nope' }), (e) => e.code === 'NOT_FOUND', 'unknown task id must stay NOT_FOUND through the map');
+});
+
+await check('indexes stay exact after snapshot trims (events + messages dropped by a restore)', async () => {
+  const b1 = await createBus(new MemoryStore(), { name: 'TrimSrc' });
+  await b1.registerAgent({ name: 't-a' });
+  await b1.registerAgent({ name: 't-b' });
+  let firstId = null;
+  for (let i = 0; i < 40; i++) { const m = await b1.sendMessage({ from: 't-a', to: 't-b', body: `trim ${i}` }); if (firstId === null) firstId = m.id; }
+  const snap = await b1.snapshot();
+  // Simulate a trimmed history: drop the first 15 events and 10 messages.
+  snap.events = snap.events.slice(15);
+  snap.messages = snap.messages.slice(10);
+  const b2 = await createBus(new MemoryStore(), { name: 'TrimDst' });
+  await b2.restore(snap);
+  // _restore appends its own workspace.restore event, so the expected
+  // replay is the surviving events plus that one new head event.
+  const restoreSeq = b2.state.seq;
+  const s0 = await b2.sync({ sinceSeq: 0, limit: 1000 });
+  assert.deepEqual(s0.events.map(e => e.seq), [...snap.events.map(e => e.seq), restoreSeq], 'sync must replay exactly the surviving events');
+  const mid = snap.events[10].seq;
+  const sMid = await b2.sync({ sinceSeq: mid, limit: 1000 });
+  assert.deepEqual(sMid.events.map(e => e.seq), [...snap.events.filter(e => e.seq > mid).map(e => e.seq), restoreSeq], 'sync from a mid cursor must be exact');
+  await assert.rejects(() => b2.thread(firstId), (e) => e.code === 'NOT_FOUND', 'a trimmed message must not resolve through the index');
+  const inbox = await b2.inbox('t-b', { markRead: false, limit: 50 });
+  assert.equal(inbox.length, 30, 'inbox must see exactly the surviving messages');
+  // and the bus keeps working on the rebuilt indexes
+  const m2 = await b2.sendMessage({ from: 't-a', to: 't-b', body: 'post-restore' });
+  assert.equal((await b2.thread(m2.id)).length, 1);
+});
+
 /* ---------------- supply chain ---------------- */
 console.log('supply chain:');
 await check('pack manifest matches the allowlist (v0.5.8)', async () => {

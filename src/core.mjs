@@ -530,6 +530,15 @@ export class GhostBus {
     // diff everything. A failed save restores the hint (see _save).
     this._dirty = new Set();
     this._dirtyFull = false;
+    // Read indexes (v0.7.0): id -> object maps for messages and tasks,
+    // so hot lookups (thread root, task claim/complete, blockedBy
+    // checks) are O(1) instead of array scans as history accumulates.
+    // Derived state only: rebuilt wholesale by _init whenever a shared
+    // store reloads the state tree (local transports) and by _restore;
+    // maintained incrementally on the owning-store path (hosted), where
+    // _init never reloads. The arrays remain the source of truth.
+    this._msgById = new Map();
+    this._taskById = new Map();
     // Mutation mutex (v0.5.1): a promise chain serializing every public
     // operation's load -> mutate -> save cycle on THIS instance. Without it,
     // concurrent calls interleave their cycles against the shared store and
@@ -575,9 +584,14 @@ export class GhostBus {
     // single operation. Memory stores skip the reload.
     if (this.state && !this.store.shared) return this;
     const loaded = await this.store.load();
-    if (loaded) this.state = loaded;
-    else if (!this.state) this.state = emptyState(this.workspaceInfo);
+    if (loaded) { this.state = loaded; this._rebuildIndexes(); }
+    else if (!this.state) { this.state = emptyState(this.workspaceInfo); this._rebuildIndexes(); }
     return this;
+  }
+
+  _rebuildIndexes() {
+    this._msgById = new Map(this.state.messages.map(m => [m.id, m]));
+    this._taskById = new Map(this.state.tasks.map(t => [t.id, t]));
   }
 
   _touch(...sections) { for (const s of sections) this._dirty.add(s); }
@@ -744,8 +758,12 @@ export class GhostBus {
       createdAt: now(), readBy: [from],
     };
     this.state.messages.push(msg);
+    this._msgById.set(msg.id, msg);
     this._touch('messages');
-    if (this.state.messages.length > 10000) this.state.messages.splice(0, this.state.messages.length - 10000);
+    if (this.state.messages.length > 10000) {
+      const removed = this.state.messages.splice(0, this.state.messages.length - 10000);
+      for (const m of removed) this._msgById.delete(m.id);
+    }
     this._event('message.send', from, `${from} -> ${to} (#${msg.id})`, { to, channel: msg.channel, messageId: msg.id, excerpt: msg.body.slice(0, 280) });
     await this._save();
     return clone(msg);
@@ -756,10 +774,20 @@ export class GhostBus {
   async _inbox(agentName, { unreadOnly = false, limit = 50, markRead = true, token = null } = {}) {
     await this.init();
     this._requireAgent(agentName, token);
-    let msgs = this.state.messages.filter(m =>
-      m.to === agentName || m.to === '*' || m.from === agentName);
-    if (unreadOnly) msgs = msgs.filter(m => !m.readBy.includes(agentName));
-    msgs = tailSlice(msgs, clampLimit(limit, 50, 500));
+    // The inbox is the latest `limit` matching messages: scan from the
+    // newest end and stop once the page is full, instead of filtering
+    // the whole history on every read (v0.7.0). The collected set is
+    // exactly filter(...)+tailSlice(...) — same messages, same order.
+    const lim = clampLimit(limit, 50, 500);
+    const all = this.state.messages;
+    const picked = [];
+    for (let i = all.length - 1; i >= 0 && picked.length < lim; i--) {
+      const m = all[i];
+      if (!(m.to === agentName || m.to === '*' || m.from === agentName)) continue;
+      if (unreadOnly && m.readBy.includes(agentName)) continue;
+      picked.push(m);
+    }
+    let msgs = picked.reverse();
     if (markRead) {
       let changed = false;
       for (const m of msgs) if (!m.readBy.includes(agentName)) { m.readBy.push(agentName); changed = true; }
@@ -772,7 +800,7 @@ export class GhostBus {
   async _thread(id, { agent = null, token = null } = {}) {
     await this.init();
     const viewer = this._viewerOf(agent, token);
-    const root = this.state.messages.find(m => m.id === Number(id));
+    const root = this._msgById.get(Number(id));
     if (!root || !this._canSee(root, viewer)) throw fail(`message not found: ${id}`, 'NOT_FOUND');
     return clone(this.state.messages.filter(m => (m.id === root.id || m.threadId === root.id) && this._canSee(m, viewer)));
   }
@@ -801,6 +829,7 @@ export class GhostBus {
       history: [{ at: now(), by: from, action: needsApproval ? 'created (awaiting approval)' : 'created' }],
     };
     this.state.tasks.push(task);
+    this._taskById.set(task.id, task);
     this._touch('tasks');
     this._event('task.create', from, `task #${task.id}: ${task.title}`);
     await this._save();
@@ -821,6 +850,7 @@ export class GhostBus {
     const drop = new Set(evictable.slice(0, need).map(t => t.id));
     if (tasks.length - drop.size >= max) throw fail(`task quota reached (max ${max} per workspace, all still active)`, 'QUOTA');
     this.state.tasks = tasks.filter(t => !drop.has(t.id));
+    for (const id of drop) this._taskById.delete(id);
     this._event('task.prune', 'system', `pruned ${drop.size} finished task(s) at the ${max}-task quota`, { pruned: drop.size });
   }
 
@@ -874,7 +904,7 @@ export class GhostBus {
     if (task.status === 'claimed') throw Object.assign(new Error(`task #${id} already claimed by ${task.claimedBy}`), { code: 'ALREADY_CLAIMED' });
     if (task.status !== 'queued') throw fail(`task #${id} cannot be claimed (status: ${task.status})`, 'CONFLICT');
     if (task.assignee && task.assignee !== by) throw fail(`task #${id} is assigned to ${task.assignee}`, 'CONFLICT');
-    const openBlockers = (task.blockedBy || []).filter(bid => { const b = this.state.tasks.find(t => t.id === bid); return b && !['done', 'cancelled'].includes(b.status); });
+    const openBlockers = (task.blockedBy || []).filter(bid => { const b = this._taskById.get(bid); return b && !['done', 'cancelled'].includes(b.status); });
     if (openBlockers.length) throw Object.assign(new Error(`task #${id} is blocked by unfinished task(s): ${openBlockers.join(', ')}`), { code: 'BLOCKED' });
     task.status = 'claimed'; task.claimedBy = by;
     this._touch('tasks');
@@ -916,7 +946,7 @@ export class GhostBus {
   }
 
   _task(id) {
-    const task = this.state.tasks.find(t => t.id === Number(id));
+    const task = this._taskById.get(Number(id));
     if (!task) throw fail(`task not found: ${id}`, 'NOT_FOUND');
     return task;
   }
@@ -1143,8 +1173,14 @@ export class GhostBus {
     // what a missing cursor means: replay from the start, limit-bounded.
     const since = Number.isFinite(Number(sinceSeq)) ? Math.max(0, Math.floor(Number(sinceSeq))) : 0;
     const lim = clampLimit(limit, 500, 1000);
-    const evs = this.state.events.filter(e => e.seq > since);
-    return { events: clone(evs.slice(0, lim)).map(e => this._redactEvent(e, viewer)), headSeq: this.state.seq, truncated: evs.length > lim };
+    // Events are stored in ascending seq order (appended, trimmed from
+    // the front), so the replay window is a slice, found by binary
+    // search — not a scan of the whole log on every catch-up (v0.7.0).
+    const all = this.state.events;
+    let lo = 0, hi = all.length;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (all[mid].seq <= since) lo = mid + 1; else hi = mid; }
+    const total = all.length - lo;
+    return { events: clone(all.slice(lo, lo + lim)).map(e => this._redactEvent(e, viewer)), headSeq: this.state.seq, truncated: total > lim };
   }
 
   async events(...args) { return this._serialized(() => this._events(...args)); }
@@ -1191,6 +1227,7 @@ export class GhostBus {
     const next = clone(snapshot);
     next.workspace = { ...next.workspace, id: this.state.workspace.id, name: next.workspace.name || this.state.workspace.name };
     this.state = next;
+    this._rebuildIndexes();
     this._touch('agents', 'messages', 'tasks', 'files', 'context', 'events');
     this._dirtyFull = true; // a restore can change anything, including section shapes
     this._event('workspace.restore', by, `workspace restored from snapshot (${next.agents.length} agents, ${next.tasks.length} tasks, ${next.messages.length} messages)`);

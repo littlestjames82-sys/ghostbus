@@ -30,7 +30,7 @@ Built and in use: 29 MCP tools across presence, messages, tasks, a shared worksp
 ```bash
 git clone https://github.com/littlestjames82-sys/ghostbus.git ghostbus && cd ghostbus
 node examples/two-agent-demo.mjs   # watch a planner and a builder cooperate
-node test.mjs                      # 86 checks: core, tokens, capsules, dependencies, sync, persistence, concurrency, MCP stdio, HTTP, SSE, CLI, hosted security, hostile input, input fuzz, load & resilience, token lifecycle, journal store, sharded mode, pack manifest
+node test.mjs                      # 88 checks: core, tokens, capsules, dependencies, sync, persistence, concurrency, MCP stdio, HTTP, SSE, CLI, hosted security, hostile input, input fuzz, load & resilience, token lifecycle, journal store, sharded mode, read indexes, pack manifest
 node examples/three-agent-team.mjs # planner + builder + reviewer, no human relaying
 ```
 

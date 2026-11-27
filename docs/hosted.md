@@ -337,10 +337,21 @@ sandbox and is not claimed. Default stays `--workers 1`.
 - **Sustained load settles lower than burst load.** The 120 s soak
   averaged ~181 ops/s and ended at ~3.7 MB of state (RSS plateaued in
   a ~250–280 MB band): the journal removed the write-side state tax,
-  but reads and list scans still grow with accumulated history, so a
-  long-lived busy workspace runs slower than a fresh one. Indexing
-  those scans is the next optimization frontier if a real workspace
-  ever needs it — noted, not hidden.
+  but a long-lived busy workspace still runs slower than a fresh one.
+- **Read indexes removed the history tax from reads — and the soak
+  says reads were never the ceiling.** Hot reads no longer scan:
+  message/task lookups are O(1) id maps, catch-up sync slices the
+  seq-ordered event log by binary search, and the inbox scans from
+  the newest end and stops when its page is full (micro-benchmark at
+  the 10k-message cap: inbox 0.084 ms vs 0.290 ms for the old
+  filter-everything read; sync's remaining cost is cloning/redacting
+  the page it returns, which no index changes). A post-index soak
+  re-run measured ~177 ops/s vs ~181 before — unchanged within this
+  VM's run-to-run noise. The remaining ceiling is per-workspace
+  serialization on one event loop, which is what sharding (below)
+  spreads across processes. The indexes still earn their place: read
+  cost no longer grows with history at all, so raising the history
+  caps later costs writes, not reads.
 - **Backup/restore is drilled, not just documented.** The runbook's
   procedure (tar the data directory → restore into a fresh directory
   → boot) was executed end to end: registry, snapshot and journal all
